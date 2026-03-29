@@ -20,7 +20,14 @@ type RepoBranch = {
   dirty: boolean;
 };
 
-type RunState = {
+type RunModelSnapshot = {
+  modelProvider: string;
+  modelId: string;
+  thinkingLevel: string;
+  modelDisplay: string;
+};
+
+type RunState = RunModelSnapshot & {
   runId: string;
   planFile: string;
   extraInstructions?: string;
@@ -42,7 +49,7 @@ type RunState = {
   notifiedTerminalState?: boolean;
 };
 
-type StatusData = {
+type StatusData = Partial<RunModelSnapshot> & {
   state?: string;
   phase?: string;
   success?: boolean;
@@ -127,6 +134,107 @@ function stripMarkdownExtension(value: string): string {
 
 function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+export function formatRunModelDisplay(model: { provider: string; id: string }, thinkingLevel: string): string {
+  return `${model.provider}/${model.id}:${thinkingLevel}`;
+}
+
+export function formatRunStatusLabel(state: string, phase?: string, modelDisplay?: string): string {
+  const parts = (() => {
+    switch (state) {
+      case "preparing":
+        return ["⚙ preparing"];
+      case "running":
+        return ["▶ running"];
+      case "verifying":
+        return ["🧪 verifying"];
+      case "blocked":
+        return ["⛔ blocked"];
+      case "failed":
+        return ["✗ failed"];
+      case "done":
+        return ["✓ done"];
+      case "stopped":
+        return ["■ stopped"];
+      default:
+        return [state];
+    }
+  })();
+
+  if (phase) parts.push(phase);
+  if (modelDisplay) parts.push(modelDisplay);
+  return parts.join(" · ");
+}
+
+export function buildInitialStatus(
+  run: Pick<RunState, "summaryFile" | "planFile" | "tmuxSession" | "branchName"> & Partial<RunModelSnapshot>,
+  repos: RepoBranch[],
+): StatusData {
+  return {
+    state: "preparing",
+    phase: "queued",
+    success: false,
+    blocked: false,
+    modifiedRepos: repos.map((repo) => repo.name),
+    modifiedFiles: [],
+    lastUpdate: new Date().toISOString(),
+    summaryFile: run.summaryFile,
+    planFile: run.planFile,
+    tmuxSession: run.tmuxSession,
+    branchName: run.branchName,
+    message: "Run created. Waiting for child pi to start.",
+    modelProvider: run.modelProvider,
+    modelId: run.modelId,
+    thinkingLevel: run.thinkingLevel,
+    modelDisplay: run.modelDisplay,
+  };
+}
+
+export function buildInitialSummary(
+  run: Pick<RunState, "planFile" | "branchName"> & Partial<RunModelSnapshot>,
+  repos: RepoBranch[],
+): string {
+  return [
+    "# Run Summary",
+    `- Result: preparing`,
+    `- Plan: ${run.planFile}`,
+    `- Branch: ${run.branchName}`,
+    ...(run.modelDisplay ? [`- Model: ${run.modelDisplay}`] : []),
+    `- Repos: ${repos.length > 0 ? repos.map((repo) => repo.name).join(", ") : "none detected"}`,
+    `- Current phase: queued`,
+    `- Notes: Child pi has not started yet.`,
+    "",
+  ].join("\n");
+}
+
+function buildStoppedSummary(run: Pick<RunState, "planFile" | "branchName"> & Partial<RunModelSnapshot>): string {
+  return [
+    "# Run Summary",
+    "- Result: stopped",
+    "- Current phase: stopped-by-user",
+    `- Plan: ${run.planFile}`,
+    `- Branch: ${run.branchName}`,
+    ...(run.modelDisplay ? [`- Model: ${run.modelDisplay}`] : []),
+    "- Notes: Run was stopped manually.",
+    "",
+  ].join("\n");
+}
+
+export function buildRunScript(
+  run: Pick<RunState, "workdir" | "taskFile" | "fullJson" | "stderrLog" | "exitCodeFile" | "modelProvider" | "modelId" | "thinkingLevel">,
+): string {
+  return [
+    "#!/bin/zsh",
+    "set -u",
+    `cd ${shellQuote(run.workdir)} || exit 1`,
+    'source "$HOME/.zshrc"',
+    `pi --model ${shellQuote(`${run.modelProvider}/${run.modelId}`)} --thinking ${shellQuote(run.thinkingLevel)} --mode json -p @${shellQuote(run.taskFile)} > ${shellQuote(run.fullJson)} 2> ${shellQuote(run.stderrLog)}`,
+    "code=$?",
+    `printf '%s\\n' \"$code\" > ${shellQuote(run.exitCodeFile)}`,
+    "exit \"$code\"",
+    "",
+  ].join("\n");
 }
 
 async function exists(path: string): Promise<boolean> {
@@ -498,28 +606,6 @@ export default function planRunnerExtension(pi: ExtensionAPI) {
     startPoller();
   }
 
-  function formatState(state: string, phase?: string): string {
-    const suffix = phase ? ` · ${phase}` : "";
-    switch (state) {
-      case "preparing":
-        return `⚙ preparing${suffix}`;
-      case "running":
-        return `▶ running${suffix}`;
-      case "verifying":
-        return `🧪 verifying${suffix}`;
-      case "blocked":
-        return `⛔ blocked${suffix}`;
-      case "failed":
-        return `✗ failed${suffix}`;
-      case "done":
-        return `✓ done${suffix}`;
-      case "stopped":
-        return `■ stopped${suffix}`;
-      default:
-        return state + suffix;
-    }
-  }
-
   async function tmuxSessionExists(session: string): Promise<boolean> {
     const result = await pi.exec("tmux", ["has-session", "-t", session]);
     return result.code === 0;
@@ -554,7 +640,8 @@ export default function planRunnerExtension(pi: ExtensionAPI) {
 
     const { run, status, derivedState } = await currentStatus();
     const phase = status?.phase ?? status?.currentGate;
-    const label = formatState(derivedState, phase);
+    const modelDisplay = run.modelDisplay ?? status?.modelDisplay;
+    const label = formatRunStatusLabel(derivedState, phase, modelDisplay);
     ctx.ui.setStatus(STATUS_ID, ctx.ui.theme.fg(derivedState === "blocked" || derivedState === "failed" ? "warning" : "accent", label));
 
     activeRun.lastKnownState = derivedState;
@@ -586,31 +673,8 @@ export default function planRunnerExtension(pi: ExtensionAPI) {
   }
 
   async function writeInitialArtifacts(run: RunState, repos: RepoBranch[]): Promise<void> {
-    const initialStatus: StatusData = {
-      state: "preparing",
-      phase: "queued",
-      success: false,
-      blocked: false,
-      modifiedRepos: repos.map((repo) => repo.name),
-      modifiedFiles: [],
-      lastUpdate: new Date().toISOString(),
-      summaryFile: run.summaryFile,
-      planFile: run.planFile,
-      tmuxSession: run.tmuxSession,
-      branchName: run.branchName,
-      message: "Run created. Waiting for child pi to start.",
-    };
-
-    const initialSummary = [
-      "# Run Summary",
-      `- Result: preparing`,
-      `- Plan: ${run.planFile}`,
-      `- Branch: ${run.branchName}`,
-      `- Repos: ${repos.length > 0 ? repos.map((repo) => repo.name).join(", ") : "none detected"}`,
-      `- Current phase: queued`,
-      `- Notes: Child pi has not started yet.`,
-      "",
-    ].join("\n");
+    const initialStatus = buildInitialStatus(run, repos);
+    const initialSummary = buildInitialSummary(run, repos);
 
     await writeFile(run.statusFile, `${JSON.stringify(initialStatus, null, 2)}\n`, "utf8");
     await writeFile(run.summaryFile, initialSummary, "utf8");
@@ -633,6 +697,7 @@ export default function planRunnerExtension(pi: ExtensionAPI) {
       `摘要文件：${run.summaryFile}`,
       `验证日志：${run.verifyLog}`,
       `完整事件输出：${run.fullJson}`,
+      `固定执行模型：${run.modelDisplay}`,
       ...extraInstructionsSection,
       "执行模式：单执行器连续运行",
       "- 先完整阅读计划文件，再开始实施。",
@@ -647,10 +712,11 @@ export default function planRunnerExtension(pi: ExtensionAPI) {
       "",
       "状态更新要求：",
       "1. 一开始就用 write 覆盖状态文件，至少写入 state=running、phase=reading-plan、lastUpdate。",
-      "2. 每完成一个 gate 或重要阶段，都更新状态文件和摘要文件。",
-      "3. 开始验证时，将 state 或 phase 改成 verifying。",
-      "4. 成功完成后，写 state=done、success=true。",
-      "5. 被阻塞时，写 state=blocked，并在摘要中说明原因、已尝试动作、建议下一步。",
+      "2. 每次更新状态文件时，都保留 modelProvider、modelId、thinkingLevel、modelDisplay 这四个字段。",
+      "3. 每完成一个 gate 或重要阶段，都更新状态文件和摘要文件。",
+      "4. 开始验证时，将 state 或 phase 改成 verifying。",
+      "5. 成功完成后，写 state=done、success=true。",
+      "6. 被阻塞时，写 state=blocked，并在摘要中说明原因、已尝试动作、建议下一步。",
       "",
       "状态文件 JSON 示例：",
       "```json",
@@ -665,10 +731,15 @@ export default function planRunnerExtension(pi: ExtensionAPI) {
         lastUpdate: new Date().toISOString(),
         summaryFile: run.summaryFile,
         message: "Started reading the plan.",
+        modelProvider: run.modelProvider,
+        modelId: run.modelId,
+        thinkingLevel: run.thinkingLevel,
+        modelDisplay: run.modelDisplay,
       }, null, 2),
       "```",
       "",
       "摘要文件要求：",
+      `- 在摘要里保留固定模型：${run.modelDisplay}`,
       "- 内容尽量短，只保留结果、当前阶段、已修改文件、验证结果、风险/阻塞、下一步建议。",
       "- 不要把长日志塞进摘要。长日志放到验证日志或 stderr。",
       "",
@@ -682,20 +753,6 @@ export default function planRunnerExtension(pi: ExtensionAPI) {
       "- 不要要求主线程再去读大日志，除非确实 blocked。",
       "",
       "现在开始：先读取计划文件，再更新状态文件和摘要文件。",
-      "",
-    ].join("\n");
-  }
-
-  function buildRunScript(run: RunState): string {
-    return [
-      "#!/bin/zsh",
-      "set -u",
-      `cd ${shellQuote(run.workdir)} || exit 1`,
-      'source "$HOME/.zshrc"',
-      `pi --mode json -p @${shellQuote(run.taskFile)} > ${shellQuote(run.fullJson)} 2> ${shellQuote(run.stderrLog)}`,
-      "code=$?",
-      `printf '%s\n' \"$code\" > ${shellQuote(run.exitCodeFile)}`,
-      "exit \"$code\"",
       "",
     ].join("\n");
   }
@@ -754,9 +811,10 @@ export default function planRunnerExtension(pi: ExtensionAPI) {
 
   async function renderSummaryMessage(run: RunState): Promise<void> {
     const summary = (await exists(run.summaryFile)) ? await readFile(run.summaryFile, "utf8") : "Summary file does not exist yet.";
+    const modelLine = run.modelDisplay ? `Model: ${run.modelDisplay}\n\n` : "";
     pi.sendMessage({
       customType: "plan-runner-summary",
-      content: `## Plan Runner Summary\n\nRun ID: ${run.runId}\n\n${summary}`,
+      content: `## Plan Runner Summary\n\nRun ID: ${run.runId}\n${modelLine}${summary}`,
       display: true,
     });
   }
@@ -772,6 +830,14 @@ export default function planRunnerExtension(pi: ExtensionAPI) {
         ctx.ui.notify(message, message.startsWith("Usage:") ? "warning" : "error");
         return;
       }
+
+      const currentModel = ctx.model;
+      if (!currentModel) {
+        ctx.ui.notify("Cannot start /run-plan because the current session model is unavailable.", "error");
+        return;
+      }
+      const thinkingLevel = pi.getThinkingLevel();
+      const modelDisplay = formatRunModelDisplay(currentModel, thinkingLevel);
 
       if (activeRun) {
         const running = await tmuxSessionExists(activeRun.tmuxSession);
@@ -820,6 +886,10 @@ export default function planRunnerExtension(pi: ExtensionAPI) {
         branchName,
         repos: repoBranches,
         startedAt: new Date().toISOString(),
+        modelProvider: currentModel.provider,
+        modelId: currentModel.id,
+        thinkingLevel,
+        modelDisplay,
       };
 
       await writeInitialArtifacts(run, repoBranches);
@@ -828,6 +898,10 @@ export default function planRunnerExtension(pi: ExtensionAPI) {
       await writeFile(join(runDir, "README.txt"), [
         `Run ID: ${run.runId}`,
         `Plan: ${run.planFile}`,
+        `Model: ${run.modelDisplay}`,
+        `Model provider: ${run.modelProvider}`,
+        `Model ID: ${run.modelId}`,
+        `Thinking level: ${run.thinkingLevel}`,
         ...(run.extraInstructions ? [`Extra instructions: ${run.extraInstructions}`] : []),
         `Tmux session: ${run.tmuxSession}`,
         `Status: ${run.statusFile}`,
@@ -847,7 +921,7 @@ export default function planRunnerExtension(pi: ExtensionAPI) {
         const repoNote = repoBranches.length > 0
           ? repoBranches.map((repo) => `${repo.name} -> ${branchName}`).join(", ")
           : "no repo detected";
-        ctx.ui.notify(`Started run ${run.runId}\nTmux: ${run.tmuxSession}\nBranches: ${repoNote}`, "success");
+        ctx.ui.notify(`Started run ${run.runId}\nModel: ${run.modelDisplay}\nTmux: ${run.tmuxSession}\nBranches: ${repoNote}`, "success");
       }
     },
   });
@@ -918,17 +992,13 @@ export default function planRunnerExtension(pi: ExtensionAPI) {
         lastUpdate: new Date().toISOString(),
         summaryFile: activeRun.summaryFile,
         message: "Run stopped by user.",
+        modelProvider: activeRun.modelProvider,
+        modelId: activeRun.modelId,
+        thinkingLevel: activeRun.thinkingLevel,
+        modelDisplay: activeRun.modelDisplay,
       };
       await writeFile(activeRun.statusFile, `${JSON.stringify(stoppedStatus, null, 2)}\n`, "utf8");
-      await writeFile(activeRun.summaryFile, [
-        "# Run Summary",
-        "- Result: stopped",
-        "- Current phase: stopped-by-user",
-        `- Plan: ${activeRun.planFile}`,
-        `- Branch: ${activeRun.branchName}`,
-        "- Notes: Run was stopped manually.",
-        "",
-      ].join("\n"), "utf8");
+      await writeFile(activeRun.summaryFile, buildStoppedSummary(activeRun), "utf8");
 
       activeRun.notifiedTerminalState = true;
       persistState();

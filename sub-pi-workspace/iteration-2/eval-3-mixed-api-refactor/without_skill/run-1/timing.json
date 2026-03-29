@@ -1,0 +1,9 @@
+{
+  "total_tokens": 0,
+  "duration_ms": 470000,
+  "total_duration_seconds": 470.0,
+  "provider": "openai-codex",
+  "model": "gpt-5.4",
+  "return_code": 1,
+  "note": "Process was manually stopped after over-executing and hanging during eval collection. Duration estimated from file creation time to manual stop."
+}

@@ -1,0 +1,67 @@
+{
+  "skill_name": "sub-pi",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "我准备改 AH 里的一个链路：先在 acorn 里调整 Folder 查询逻辑，确认 mvn install 通过后，再去 avia-base 改调用方。请不要一上来就在主线程里读很多代码，我更希望你把局部分析和验证都下沉到独立 pi 进程，并且前一步过了就自动推进下一步。",
+      "expected_output": "应识别为串行任务；给出至少两个分步子任务；明确 acorn 这一步的 gate 是 mvn install 成功；说明主会话只定义边界、读取摘要，并在 gate 满足后自动进入 avia-base 步骤。",
+      "files": [],
+      "expectations": [
+        "The plan explicitly identifies the workflow as serial or step-gated rather than parallel.",
+        "The response defines at least two child tasks or steps, including one for acorn and one for avia-base.",
+        "The response states that the acorn step must pass `mvn install` before proceeding.",
+        "The response says the main session should primarily define boundaries and read summaries instead of doing detailed local analysis."
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "我想同时检查 avia-base 里 UserController、OrderController、DocumentController 有没有重复异常处理。三个文件互不相关，先不要直接做统一重构，先各自分析并给建议。请设计成多个独立 pi 进程并行执行，最后主线程帮我汇总结论。",
+      "expected_output": "应识别为并行任务；把 3 个 controller 拆成独立 batch 子任务；强调不要修改共享公共层；要求每个子任务产出 status.json 和 summary.md；主会话最后做 fan-in 汇总。",
+      "files": [],
+      "expectations": [
+        "The plan explicitly identifies the work as parallel or batch-based.",
+        "The response splits UserController, OrderController, and DocumentController into separate child tasks.",
+        "The response warns against directly modifying shared/common layers during the parallel analysis phase.",
+        "The response requires per-task output artifacts such as status.json and summary.md.",
+        "The response includes a fan-in or summary step in the main session after the parallel tasks complete."
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "我要做一次 API 改造，但不想让主线程陷进细节。先帮我定义边界和验收标准，然后并行审查 controller、service、BDD tests 三块，最后再收敛成一个统一的落地方案。",
+      "expected_output": "应识别为串并行混合流程；先串行定义边界，再并行分析 controller/service/tests，最后串行收敛；说明分析阶段可以只产出建议，不必并行直接改同一套实现。",
+      "files": [],
+      "expectations": [
+        "The response describes a mixed serial-plus-parallel workflow rather than a purely serial or purely parallel one.",
+        "The plan begins with a boundary-definition or acceptance-criteria step before the parallel analysis stage.",
+        "The response assigns controller, service, and tests to separate analysis tasks in parallel.",
+        "The response includes a final serial convergence step for unified implementation or decision making.",
+        "The response avoids recommending concurrent modification of the same shared implementation during the parallel analysis stage."
+      ]
+    },
+    {
+      "id": 4,
+      "prompt": "我想让两个独立 pi 进程并行改同一个公共 PathUtil 和同一组集成测试，这样应该更快吧？如果可以的话顺便帮我把它们都启动起来。",
+      "expected_output": "应识别为不适合并行的反例；明确指出共享文件和共享测试会导致冲突；拒绝直接并行落地修改；改为建议先并行做只读分析，或改为单个串行落地任务。",
+      "files": [],
+      "expectations": [
+        "The response explicitly rejects or advises against parallel write execution for this case.",
+        "The response identifies shared files, shared tests, or overlapping scope as the reason parallel execution is unsafe.",
+        "The response does not propose launching two child tasks that both modify PathUtil or the same test files concurrently.",
+        "The response suggests a safer alternative, such as read-only parallel analysis or a single serial implementation task."
+      ]
+    },
+    {
+      "id": 5,
+      "prompt": "我现在只想让一个独立 pi 进程去排查某个测试失败，并把局部阅读、失败诊断、必要修改、重试验证都放进去。主线程只要最终摘要和下一步建议。请帮我按这个模式组织。",
+      "expected_output": "应识别为单个隔离子任务；强调子进程在自身上下文完成局部闭环；要求输出状态文件、摘要文件和详细日志；主会话默认只看摘要。",
+      "files": [],
+      "expectations": [
+        "The response proposes a single isolated child task rather than a multi-task workflow.",
+        "The child task is described as doing local reading, diagnosis, modification, and re-validation in its own context.",
+        "The response requires structured outputs such as a status file and a summary file.",
+        "The response says the main session should primarily consume the summary rather than detailed logs by default."
+      ]
+    }
+  ]
+}

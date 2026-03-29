@@ -1,0 +1,40 @@
+{
+  "expectations": [
+    {
+      "text": "The plan explicitly identifies the workflow as serial or step-gated rather than parallel.",
+      "passed": true,
+      "evidence": "The response says it will use 串行独立 pi 进程 and defines Step 1 acorn then Step 2 avia-base."
+    },
+    {
+      "text": "The response defines at least two child tasks or steps, including one for acorn and one for avia-base.",
+      "passed": true,
+      "evidence": "It explicitly defines Step 1: acorn 子进程 and Step 2: avia-base 子进程."
+    },
+    {
+      "text": "The response states that the acorn step must pass `mvn install` before proceeding.",
+      "passed": true,
+      "evidence": "It calls out `mvn clean install` as the hard gate before continuing."
+    },
+    {
+      "text": "The response says the main session should primarily define boundaries and read summaries instead of doing detailed local analysis.",
+      "passed": true,
+      "evidence": "It says the main thread will only orchestrate and read status.json / summary.md by default."
+    }
+  ],
+  "summary": {
+    "passed": 4,
+    "failed": 0,
+    "total": 4,
+    "pass_rate": 1.0
+  },
+  "timing": {
+    "total_duration_seconds": 60.067,
+    "total_tokens": 10922
+  },
+  "execution_metrics": {
+    "total_tool_calls": 0,
+    "errors_encountered": 0,
+    "output_chars": 1896,
+    "transcript_chars": 0
+  }
+}

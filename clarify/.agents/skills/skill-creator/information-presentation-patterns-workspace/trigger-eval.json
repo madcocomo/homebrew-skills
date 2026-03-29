@@ -1,0 +1,22 @@
+[
+  {"query": "帮我解释一下这个Python文件里的订单处理逻辑，我想知道状态是怎么流转的", "should_trigger": true},
+  {"query": "刚才写的用户认证代码能给我讲讲吗？特别是登录流程是怎么走的", "should_trigger": true},
+  {"query": "我不太懂什么是OAuth 2.0，能解释一下吗", "should_trigger": true},
+  {"query": "帮我整理一下这个RESTful API的实现，我需要给团队做个说明", "should_trigger": true},
+  {"query": "这段代码里的折扣规则太复杂了，能不能画个图帮我理解", "should_trigger": true},
+  {"query": "我刚让你写的权限系统能总结一下吗？不同角色有什么区别", "should_trigger": true},
+  {"query": "这个业务规则是什么意思？感觉条件很多的样子", "should_trigger": true},
+  {"query": "需求里写的'订单金额超过1000减免15%'具体怎么算的", "should_trigger": true},
+  {"query": "帮我写个函数计算订单折扣", "should_trigger": false},
+  {"query": "这个bug怎么修？点击按钮没反应", "should_trigger": false},
+  {"query": "运行一下 npm install", "should_trigger": false},
+  {"query": "帮我搜索一下这个错误是什么意思", "should_trigger": false},
+  {"query": "今天天气怎么样", "should_trigger": false},
+  {"query": "我的代码里有内存泄漏，帮我排查一下", "should_trigger": false},
+  {"query": "把这个JSON文件格式化一下", "should_trigger": false},
+  {"query": "帮我写个Python脚本读取CSV文件", "should_trigger": false},
+  {"query": "刚才生成的代码跑不起来，报错Cannot read property 'map' of undefined", "should_trigger": false},
+  {"query": "git merge 冲突了，帮我看一下怎么解决", "should_trigger": false},
+  {"query": "用英文写一封求职邮件", "should_trigger": false},
+  {"query": "给我讲个笑话", "should_trigger": false}
+]

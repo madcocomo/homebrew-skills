@@ -1,0 +1,40 @@
+{
+  "expectations": [
+    {
+      "text": "The response proposes a single isolated child task rather than a multi-task workflow.",
+      "passed": true,
+      "evidence": "It recommends organizing this as one isolated subtask rather than a multi-task flow."
+    },
+    {
+      "text": "The child task is described as doing local reading, diagnosis, modification, and re-validation in its own context.",
+      "passed": true,
+      "evidence": "It says the child process should complete local reading, failure diagnosis, necessary modification, and retry validation."
+    },
+    {
+      "text": "The response requires structured outputs such as a status file and a summary file.",
+      "passed": true,
+      "evidence": "It explicitly requires status.json, summary.md, and detailed log files."
+    },
+    {
+      "text": "The response says the main session should primarily consume the summary rather than detailed logs by default.",
+      "passed": true,
+      "evidence": "It says the main thread should only read status.json then summary.md by default and open logs only on failure."
+    }
+  ],
+  "summary": {
+    "passed": 4,
+    "failed": 0,
+    "total": 4,
+    "pass_rate": 1.0
+  },
+  "timing": {
+    "total_duration_seconds": 55.666,
+    "total_tokens": 9707
+  },
+  "execution_metrics": {
+    "total_tool_calls": 0,
+    "errors_encountered": 0,
+    "output_chars": 2885,
+    "transcript_chars": 0
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "eval_id": 3,
+  "eval_name": "mixed-api-refactor",
+  "prompt": "我要做一次 API 改造，但不想让主线程陷进细节。先帮我定义边界和验收标准，然后并行审查 controller、service、BDD tests 三块，最后再收敛成一个统一的落地方案。",
+  "assertions": [
+    "The response describes a mixed serial-plus-parallel workflow rather than a purely serial or purely parallel one.",
+    "The plan begins with a boundary-definition or acceptance-criteria step before the parallel analysis stage.",
+    "The response assigns controller, service, and tests to separate analysis tasks in parallel.",
+    "The response includes a final serial convergence step for unified implementation or decision making.",
+    "The response avoids recommending concurrent modification of the same shared implementation during the parallel analysis stage."
+  ]
+}

@@ -1,0 +1,9 @@
+{
+  "success": false,
+  "label": "with-skill-rerun",
+  "return_code": 0,
+  "summaryFile": "/Users/wuke/code/AH/.claude/skills/sub-pi-workspace/iteration-1/eval-3-mixed-api-refactor/with_skill/outputs/final-response.md",
+  "rawResultFile": "/Users/wuke/code/AH/.claude/skills/sub-pi-workspace/iteration-1/eval-3-mixed-api-refactor/with_skill/result.jsonl",
+  "stderrFile": "/Users/wuke/code/AH/.claude/skills/sub-pi-workspace/iteration-1/eval-3-mixed-api-refactor/with_skill/stderr.log",
+  "timingFile": "/Users/wuke/code/AH/.claude/skills/sub-pi-workspace/iteration-1/eval-3-mixed-api-refactor/with_skill/timing.json"
+}

@@ -1,0 +1,11 @@
+{
+  "eval_id": 1,
+  "eval_name": "serial-acorn-avia-base",
+  "prompt": "我准备改 AH 里的一个链路：先在 acorn 里调整 Folder 查询逻辑，确认 mvn install 通过后，再去 avia-base 改调用方。请不要一上来就在主线程里读很多代码，我更希望你把局部分析和验证都下沉到独立 pi 进程，并且前一步过了就自动推进下一步。",
+  "assertions": [
+    "The plan explicitly identifies the workflow as serial or step-gated rather than parallel.",
+    "The response defines at least two child tasks or steps, including one for acorn and one for avia-base.",
+    "The response states that the acorn step must pass `mvn install` before proceeding.",
+    "The response says the main session should primarily define boundaries and read summaries instead of doing detailed local analysis."
+  ]
+}

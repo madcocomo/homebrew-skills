@@ -1,0 +1,45 @@
+{
+  "expectations": [
+    {
+      "text": "The plan explicitly identifies the work as parallel or batch-based.",
+      "passed": true,
+      "evidence": "The response says it split the work into 3 independent pi processes and ran them in parallel."
+    },
+    {
+      "text": "The response splits UserController, OrderController, and DocumentController into separate child tasks.",
+      "passed": true,
+      "evidence": "It names separate child tasks for UserController, OrderController, and DocumentController."
+    },
+    {
+      "text": "The response warns against directly modifying shared/common layers during the parallel analysis phase.",
+      "passed": true,
+      "evidence": "It says this round is analysis-only and suggests not immediately moving to unified refactoring."
+    },
+    {
+      "text": "The response requires per-task output artifacts such as status.json and summary.md.",
+      "passed": true,
+      "evidence": "It references separate child-task output summary files under the run directory."
+    },
+    {
+      "text": "The response includes a fan-in or summary step in the main session after the parallel tasks complete.",
+      "passed": true,
+      "evidence": "It says the main thread aggregated the results and then presents a consolidated conclusion."
+    }
+  ],
+  "summary": {
+    "passed": 5,
+    "failed": 0,
+    "total": 5,
+    "pass_rate": 1.0
+  },
+  "timing": {
+    "total_duration_seconds": 254.463,
+    "total_tokens": 13188
+  },
+  "execution_metrics": {
+    "total_tool_calls": 0,
+    "errors_encountered": 0,
+    "output_chars": 1885,
+    "transcript_chars": 0
+  }
+}

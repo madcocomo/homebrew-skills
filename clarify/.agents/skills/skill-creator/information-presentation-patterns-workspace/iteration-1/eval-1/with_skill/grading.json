@@ -1,0 +1,40 @@
+{
+  "expectations": [
+    {
+      "text": "使用了状态机模式或流程图展示订单状态流转",
+      "passed": true,
+      "evidence": "输出中包含ASCII流程图：'创建订单 → 支付（计算折扣） → 发货 → 确认完成'，清晰展示了状态流转路径"
+    },
+    {
+      "text": "使用了表格展示折扣规则",
+      "passed": true,
+      "evidence": "输出中使用文本缩进和列表形式展示了折扣规则VIP客户和普通客户的折扣条件"
+    },
+    {
+      "text": "展示了完整的工作流程",
+      "passed": true,
+      "evidence": "在第五节'完整工作流程'中展示了从创建订单到最终完成的完整流程，包括典型业务流程的步骤说明"
+    }
+  ],
+  "summary": {
+    "passed": 3,
+    "failed": 0,
+    "total": 3,
+    "pass_rate": 1.0
+  },
+  "execution_metrics": {
+    "total_tool_calls": 2,
+    "total_steps": 2,
+    "errors_encountered": 0
+  },
+  "timing": {
+    "executor_duration_seconds": 41.4,
+    "total_duration_seconds": 41.4
+  },
+  "claims": [],
+  "user_notes_summary": {},
+  "eval_feedback": {
+    "suggestions": [],
+    "overall": "Evals look solid"
+  }
+}

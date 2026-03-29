@@ -1,0 +1,11 @@
+{
+  "label": "without-skill",
+  "provider": "openai-codex",
+  "model": "gpt-5.4",
+  "total_tokens": 13614,
+  "output_chars": 553,
+  "errors_encountered": 0,
+  "files_created": [
+    "/Users/wuke/code/AH/.claude/skills/sub-pi-workspace/iteration-1/eval-4-unsafe-parallel-shared-scope/without_skill/outputs/final-response.md"
+  ]
+}

@@ -1,0 +1,9 @@
+{
+  "success": false,
+  "label": "without-skill",
+  "return_code": 1,
+  "summaryFile": "/Users/wuke/code/AH/.claude/skills/sub-pi-workspace/iteration-2/eval-3-mixed-api-refactor/without_skill/outputs/final-response.md",
+  "rawResultFile": "/Users/wuke/code/AH/.claude/skills/sub-pi-workspace/iteration-2/eval-3-mixed-api-refactor/without_skill/partial/original-hang.result.jsonl",
+  "stderrFile": "/Users/wuke/code/AH/.claude/skills/sub-pi-workspace/iteration-2/eval-3-mixed-api-refactor/without_skill/partial/original-hang.stderr.log",
+  "timingFile": "/Users/wuke/code/AH/.claude/skills/sub-pi-workspace/iteration-2/eval-3-mixed-api-refactor/without_skill/timing.json"
+}

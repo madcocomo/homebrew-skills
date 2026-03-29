@@ -1,0 +1,11 @@
+{
+  "label": "without-skill",
+  "provider": "openai-codex",
+  "model": "gpt-5.4",
+  "total_tokens": 6043,
+  "output_chars": 564,
+  "errors_encountered": 0,
+  "files_created": [
+    "/Users/wuke/code/AH/.claude/skills/sub-pi-workspace/iteration-1/eval-1-serial-acorn-avia-base/without_skill/outputs/final-response.md"
+  ]
+}

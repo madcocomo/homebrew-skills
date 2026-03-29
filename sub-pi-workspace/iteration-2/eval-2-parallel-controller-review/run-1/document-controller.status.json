@@ -1,0 +1,21 @@
+{
+  "success": true,
+  "target": "DocumentController",
+  "targetExists": false,
+  "summaryFile": "/Users/wuke/code/AH/.claude/skills/sub-pi-workspace/iteration-2/eval-2-parallel-controller-review/run-1/document-controller.summary.md",
+  "findings": [
+    "在 avia-base 中未找到 DocumentController.java，也未找到 class DocumentController。",
+    "controller 目录存在多个其他控制器，但不包含 DocumentController。",
+    "GlobalExceptionHandler 已集中处理 ServiceException、ResponseStatusException、IllegalArgumentException、IllegalStateException 和通用 Exception。"
+  ],
+  "risks": [
+    "由于目标 Controller 不存在，无法直接评估其内部是否存在重复异常处理。",
+    "若后续在新的文档类 Controller 中手写 try/catch 和 ResponseEntity 映射，容易与现有 GlobalExceptionHandler 重复。",
+    "GlobalExceptionHandler 依赖 URI 分支判断，未来新增路由时可能导致相同异常返回不一致。"
+  ],
+  "suggestions": [
+    "先确认文档相关接口实际归属的 Controller，再做针对性审查。",
+    "后续新增或定位到文档类 Controller 时，优先复用 GlobalExceptionHandler，不要在 Controller 内重复做异常到 HTTP 响应映射。",
+    "若后续发现多个 Controller 重复拼装相同错误响应，再统一收敛到全局处理器或公共方法。"
+  ]
+}

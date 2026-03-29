@@ -1,0 +1,11 @@
+{
+  "label": "without-skill",
+  "provider": "openai-codex",
+  "model": "gpt-5.4",
+  "total_tokens": 8680,
+  "output_chars": 3015,
+  "errors_encountered": 0,
+  "files_created": [
+    "/Users/wuke/code/AH/.claude/skills/sub-pi-workspace/iteration-2/eval-5-isolated-debug-loop/without_skill/outputs/final-response.md"
+  ]
+}

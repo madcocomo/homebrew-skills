@@ -1,0 +1,11 @@
+{
+  "eval_id": 4,
+  "eval_name": "unsafe-parallel-shared-scope",
+  "prompt": "我想让两个独立 pi 进程并行改同一个公共 PathUtil 和同一组集成测试，这样应该更快吧？如果可以的话顺便帮我把它们都启动起来。",
+  "assertions": [
+    "The response explicitly rejects or advises against parallel write execution for this case.",
+    "The response identifies shared files, shared tests, or overlapping scope as the reason parallel execution is unsafe.",
+    "The response does not propose launching two child tasks that both modify PathUtil or the same test files concurrently.",
+    "The response suggests a safer alternative, such as read-only parallel analysis or a single serial implementation task."
+  ]
+}

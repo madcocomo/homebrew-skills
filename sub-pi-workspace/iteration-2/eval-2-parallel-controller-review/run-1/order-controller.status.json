@@ -1,0 +1,20 @@
+{
+  "success": true,
+  "target": "OrderController",
+  "targetExists": false,
+  "summaryFile": "/Users/wuke/code/AH/.claude/skills/sub-pi-workspace/iteration-2/eval-2-parallel-controller-review/run-1/order-controller.summary.md",
+  "findings": [
+    "在 avia-base 范围内未检索到 OrderController.java 或 class OrderController。",
+    "controller 目录下不存在 OrderController.java。",
+    "GlobalExceptionHandler 已集中处理 ServiceException、ResponseStatusException、IllegalArgumentException、IllegalStateException 和通用 Exception。"
+  ],
+  "risks": [
+    "由于目标 Controller 不存在，当前无法确认其内部是否存在重复 try/catch、重复异常映射或重复错误消息拼装。",
+    "GlobalExceptionHandler 使用基于 URI 的分支判断；如果未来新增 /api/orders 之类的新前缀而未同步更新，可能出现错误响应契约不一致。"
+  ],
+  "suggestions": [
+    "后续若新增 OrderController，应优先通过抛出领域异常并复用 GlobalExceptionHandler 做统一 HTTP 映射。",
+    "避免在 Controller 内部重复拼装 {\"error\": ...} 响应体或重复写 try/catch 到 ResponseEntity 的转换。",
+    "若订单接口需要特殊异常契约，建议在全局处理器或公共方法中统一收敛，而不是在单个 Controller 局部实现。"
+  ]
+}

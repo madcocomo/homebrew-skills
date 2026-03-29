@@ -1,0 +1,11 @@
+{
+  "eval_id": 5,
+  "eval_name": "isolated-debug-loop",
+  "prompt": "我现在只想让一个独立 pi 进程去排查某个测试失败，并把局部阅读、失败诊断、必要修改、重试验证都放进去。主线程只要最终摘要和下一步建议。请帮我按这个模式组织。",
+  "assertions": [
+    "The response proposes a single isolated child task rather than a multi-task workflow.",
+    "The child task is described as doing local reading, diagnosis, modification, and re-validation in its own context.",
+    "The response requires structured outputs such as a status file and a summary file.",
+    "The response says the main session should primarily consume the summary rather than detailed logs by default."
+  ]
+}

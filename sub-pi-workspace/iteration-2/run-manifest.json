@@ -1,0 +1,46 @@
+{
+  "skill_name": "sub-pi",
+  "iteration": 2,
+  "evals": [
+    {
+      "id": 1,
+      "name": "serial-acorn-avia-base",
+      "dir": "/Users/wuke/code/AH/.claude/skills/sub-pi-workspace/iteration-2/eval-1-serial-acorn-avia-base",
+      "prompt_file": "/Users/wuke/code/AH/.claude/skills/sub-pi-workspace/iteration-2/eval-1-serial-acorn-avia-base/prompt.md",
+      "with_skill_dir": "/Users/wuke/code/AH/.claude/skills/sub-pi-workspace/iteration-2/eval-1-serial-acorn-avia-base/with_skill",
+      "without_skill_dir": "/Users/wuke/code/AH/.claude/skills/sub-pi-workspace/iteration-2/eval-1-serial-acorn-avia-base/without_skill"
+    },
+    {
+      "id": 2,
+      "name": "parallel-controller-review",
+      "dir": "/Users/wuke/code/AH/.claude/skills/sub-pi-workspace/iteration-2/eval-2-parallel-controller-review",
+      "prompt_file": "/Users/wuke/code/AH/.claude/skills/sub-pi-workspace/iteration-2/eval-2-parallel-controller-review/prompt.md",
+      "with_skill_dir": "/Users/wuke/code/AH/.claude/skills/sub-pi-workspace/iteration-2/eval-2-parallel-controller-review/with_skill",
+      "without_skill_dir": "/Users/wuke/code/AH/.claude/skills/sub-pi-workspace/iteration-2/eval-2-parallel-controller-review/without_skill"
+    },
+    {
+      "id": 3,
+      "name": "mixed-api-refactor",
+      "dir": "/Users/wuke/code/AH/.claude/skills/sub-pi-workspace/iteration-2/eval-3-mixed-api-refactor",
+      "prompt_file": "/Users/wuke/code/AH/.claude/skills/sub-pi-workspace/iteration-2/eval-3-mixed-api-refactor/prompt.md",
+      "with_skill_dir": "/Users/wuke/code/AH/.claude/skills/sub-pi-workspace/iteration-2/eval-3-mixed-api-refactor/with_skill",
+      "without_skill_dir": "/Users/wuke/code/AH/.claude/skills/sub-pi-workspace/iteration-2/eval-3-mixed-api-refactor/without_skill"
+    },
+    {
+      "id": 4,
+      "name": "unsafe-parallel-shared-scope",
+      "dir": "/Users/wuke/code/AH/.claude/skills/sub-pi-workspace/iteration-2/eval-4-unsafe-parallel-shared-scope",
+      "prompt_file": "/Users/wuke/code/AH/.claude/skills/sub-pi-workspace/iteration-2/eval-4-unsafe-parallel-shared-scope/prompt.md",
+      "with_skill_dir": "/Users/wuke/code/AH/.claude/skills/sub-pi-workspace/iteration-2/eval-4-unsafe-parallel-shared-scope/with_skill",
+      "without_skill_dir": "/Users/wuke/code/AH/.claude/skills/sub-pi-workspace/iteration-2/eval-4-unsafe-parallel-shared-scope/without_skill"
+    },
+    {
+      "id": 5,
+      "name": "isolated-debug-loop",
+      "dir": "/Users/wuke/code/AH/.claude/skills/sub-pi-workspace/iteration-2/eval-5-isolated-debug-loop",
+      "prompt_file": "/Users/wuke/code/AH/.claude/skills/sub-pi-workspace/iteration-2/eval-5-isolated-debug-loop/prompt.md",
+      "with_skill_dir": "/Users/wuke/code/AH/.claude/skills/sub-pi-workspace/iteration-2/eval-5-isolated-debug-loop/with_skill",
+      "without_skill_dir": "/Users/wuke/code/AH/.claude/skills/sub-pi-workspace/iteration-2/eval-5-isolated-debug-loop/without_skill"
+    }
+  ]
+}

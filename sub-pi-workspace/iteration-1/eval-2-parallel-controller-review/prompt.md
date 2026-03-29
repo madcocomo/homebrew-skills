@@ -1,0 +1,1 @@
+我想同时检查 avia-base 里 UserController、OrderController、DocumentController 有没有重复异常处理。三个文件互不相关，先不要直接做统一重构，先各自分析并给建议。请设计成多个独立 pi 进程并行执行，最后主线程帮我汇总结论。

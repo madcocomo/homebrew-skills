@@ -1,0 +1,40 @@
+{
+  "expectations": [
+    {
+      "text": "The plan explicitly identifies the workflow as serial or step-gated rather than parallel.",
+      "passed": false,
+      "evidence": "No usable final response was produced. The original partial run over-executed into child-process orchestration, and the rescue rerun ended with fetch failed."
+    },
+    {
+      "text": "The response defines at least two child tasks or steps, including one for acorn and one for avia-base.",
+      "passed": false,
+      "evidence": "No final response file content was available for grading."
+    },
+    {
+      "text": "The response states that the acorn step must pass `mvn install` before proceeding.",
+      "passed": false,
+      "evidence": "No final response file content was available for grading."
+    },
+    {
+      "text": "The response says the main session should primarily define boundaries and read summaries instead of doing detailed local analysis.",
+      "passed": false,
+      "evidence": "No final response file content was available for grading."
+    }
+  ],
+  "summary": {
+    "passed": 0,
+    "failed": 4,
+    "total": 4,
+    "pass_rate": 0.0
+  },
+  "timing": {
+    "total_duration_seconds": 213.405,
+    "total_tokens": 0
+  },
+  "execution_metrics": {
+    "total_tool_calls": 0,
+    "errors_encountered": 1,
+    "output_chars": 0,
+    "transcript_chars": 0
+  }
+}

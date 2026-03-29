@@ -1,0 +1,22 @@
+{
+  "success": true,
+  "target": "UserController",
+  "targetExists": true,
+  "summaryFile": "/Users/wuke/code/AH/.claude/skills/sub-pi-workspace/iteration-2/eval-2-parallel-controller-review/run-1/user-controller.summary.md",
+  "findings": [
+    "UserController 文件存在，且自身没有 try/catch、没有本地异常到 HTTP 响应映射、没有重复错误消息拼装。",
+    "UserController 的异常响应主要依赖 UserService 抛出的 ResponseStatusException，以及 GlobalExceptionHandler 的统一处理。",
+    "与该 Controller 直接相关的重复点出现在 UserService.login()：catch(Exception) 后和 user 为空时都映射为 401 + 'User not existed.'。",
+    "GlobalExceptionHandler 已具备集中异常处理能力，但 UserService 仍直接携带 HTTP 语义，说明异常收敛还不彻底。"
+  ],
+  "risks": [
+    "认证失败的 HTTP 状态与错误文案目前放在 service 层，后续容易在更多接口中复制同类逻辑。",
+    "ResponseStatusException 分支不做 i18n 解析，像 'error.security.user_is_not_active' 这类 key 可能直接暴露给前端。",
+    "如果未来在 UserController 再补局部 try/catch，容易与 GlobalExceptionHandler 形成重复处理和响应格式漂移。"
+  ],
+  "suggestions": [
+    "保持 UserController 继续做薄控制器，不要为它补局部异常处理。",
+    "后续如调整认证链路，优先把 UserService 的认证失败统一收敛到 ServiceException 或专用业务异常，再由 GlobalExceptionHandler 统一映射。",
+    "顺手去重 UserService.login() 中重复的 401 映射与错误消息，并统一错误消息策略。"
+  ]
+}

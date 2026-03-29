@@ -1,0 +1,40 @@
+{
+  "expectations": [
+    {
+      "text": "使用了状态机模式或流程图展示订单状态流转",
+      "passed": false,
+      "evidence": "输出中只有文字描述的工作流程（'1. 创建订单 → 2. 支付订单 → ...'），没有使用图形化方式展示状态流转"
+    },
+    {
+      "text": "使用了表格展示折扣规则",
+      "passed": false,
+      "evidence": "输出中使用缩进列表展示折扣规则，但不是表格形式"
+    },
+    {
+      "text": "展示了完整的工作流程",
+      "passed": true,
+      "evidence": "在'工作流程'章节中展示了完整的订单处理流程"
+    }
+  ],
+  "summary": {
+    "passed": 1,
+    "failed": 2,
+    "total": 3,
+    "pass_rate": 0.33
+  },
+  "execution_metrics": {
+    "total_tool_calls": 2,
+    "total_steps": 2,
+    "errors_encountered": 0
+  },
+  "timing": {
+    "executor_duration_seconds": 44.3,
+    "total_duration_seconds": 44.3
+  },
+  "claims": [],
+  "user_notes_summary": {},
+  "eval_feedback": {
+    "suggestions": [],
+    "overall": "Evals look solid"
+  }
+}

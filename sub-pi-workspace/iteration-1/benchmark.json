@@ -1,0 +1,467 @@
+{
+  "metadata": {
+    "skill_name": "sub-pi",
+    "skill_path": "<path/to/skill>",
+    "executor_model": "<model-name>",
+    "analyzer_model": "<model-name>",
+    "timestamp": "2026-03-08T01:04:01Z",
+    "evals_run": [
+      1,
+      2,
+      3,
+      4,
+      5
+    ],
+    "runs_per_configuration": 3
+  },
+  "runs": [
+    {
+      "eval_id": 1,
+      "configuration": "with_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 0.0,
+        "passed": 0,
+        "failed": 4,
+        "total": 4,
+        "time_seconds": 213.405,
+        "tokens": 0,
+        "tool_calls": 0,
+        "errors": 1
+      },
+      "expectations": [
+        {
+          "text": "The plan explicitly identifies the workflow as serial or step-gated rather than parallel.",
+          "passed": false,
+          "evidence": "No usable final response was produced. The original partial run over-executed into child-process orchestration, and the rescue rerun ended with fetch failed."
+        },
+        {
+          "text": "The response defines at least two child tasks or steps, including one for acorn and one for avia-base.",
+          "passed": false,
+          "evidence": "No final response file content was available for grading."
+        },
+        {
+          "text": "The response states that the acorn step must pass `mvn install` before proceeding.",
+          "passed": false,
+          "evidence": "No final response file content was available for grading."
+        },
+        {
+          "text": "The response says the main session should primarily define boundaries and read summaries instead of doing detailed local analysis.",
+          "passed": false,
+          "evidence": "No final response file content was available for grading."
+        }
+      ],
+      "notes": []
+    },
+    {
+      "eval_id": 2,
+      "configuration": "with_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 1.0,
+        "passed": 5,
+        "failed": 0,
+        "total": 5,
+        "time_seconds": 261.977,
+        "tokens": 1587,
+        "tool_calls": 0,
+        "errors": 0
+      },
+      "expectations": [
+        {
+          "text": "The plan explicitly identifies the work as parallel or batch-based.",
+          "passed": true,
+          "evidence": "The response says it used 3 independent pi processes in parallel."
+        },
+        {
+          "text": "The response splits UserController, OrderController, and DocumentController into separate child tasks.",
+          "passed": true,
+          "evidence": "It lists three separate parallel sessions: user, order, and document controller review."
+        },
+        {
+          "text": "The response warns against directly modifying shared/common layers during the parallel analysis phase.",
+          "passed": true,
+          "evidence": "It says no code modifications were done and each task analyzed separately before any unified refactor."
+        },
+        {
+          "text": "The response requires per-task output artifacts such as status.json and summary.md.",
+          "passed": true,
+          "evidence": "It points to a results directory and describes per-controller analysis outputs produced by the child tasks."
+        },
+        {
+          "text": "The response includes a fan-in or summary step in the main session after the parallel tasks complete.",
+          "passed": true,
+          "evidence": "It provides a merged summary section consolidating the three child-task findings."
+        }
+      ],
+      "notes": []
+    },
+    {
+      "eval_id": 3,
+      "configuration": "with_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 0.0,
+        "passed": 0,
+        "failed": 5,
+        "total": 5,
+        "time_seconds": 213.515,
+        "tokens": 0,
+        "tool_calls": 0,
+        "errors": 1
+      },
+      "expectations": [
+        {
+          "text": "The response describes a mixed serial-plus-parallel workflow rather than a purely serial or purely parallel one.",
+          "passed": false,
+          "evidence": "No usable final response was produced. The original run over-executed into waiting for child status files; the rescue rerun ended with fetch failed."
+        },
+        {
+          "text": "The plan begins with a boundary-definition or acceptance-criteria step before the parallel analysis stage.",
+          "passed": false,
+          "evidence": "No final response file content was available for grading."
+        },
+        {
+          "text": "The response assigns controller, service, and tests to separate analysis tasks in parallel.",
+          "passed": false,
+          "evidence": "No final response file content was available for grading."
+        },
+        {
+          "text": "The response includes a final serial convergence step for unified implementation or decision making.",
+          "passed": false,
+          "evidence": "No final response file content was available for grading."
+        },
+        {
+          "text": "The response avoids recommending concurrent modification of the same shared implementation during the parallel analysis stage.",
+          "passed": false,
+          "evidence": "No final response file content was available for grading."
+        }
+      ],
+      "notes": []
+    },
+    {
+      "eval_id": 4,
+      "configuration": "with_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 1.0,
+        "passed": 4,
+        "failed": 0,
+        "total": 4,
+        "time_seconds": 32.665,
+        "tokens": 755,
+        "tool_calls": 0,
+        "errors": 0
+      },
+      "expectations": [
+        {
+          "text": "The response explicitly rejects or advises against parallel write execution for this case.",
+          "passed": true,
+          "evidence": "It opens with \u201c\u4e0d\u5efa\u8bae\uff0c\u800c\u4e14\u6211\u4e5f\u4e0d\u5e94\u8be5\u76f4\u63a5\u5e2e\u4f60\u542f\u52a8\u8fd9\u4e24\u4e2a\u5e76\u884c\u5199\u540c\u4e00\u8303\u56f4\u7684\u72ec\u7acb pi \u8fdb\u7a0b\u201d."
+        },
+        {
+          "text": "The response identifies shared files, shared tests, or overlapping scope as the reason parallel execution is unsafe.",
+          "passed": true,
+          "evidence": "It cites the same PathUtil, same integration tests, and shared build/test outputs as the conflict reason."
+        },
+        {
+          "text": "The response does not propose launching two child tasks that both modify PathUtil or the same test files concurrently.",
+          "passed": true,
+          "evidence": "It refuses to launch that unsafe write-parallel plan."
+        },
+        {
+          "text": "The response suggests a safer alternative, such as read-only parallel analysis or a single serial implementation task.",
+          "passed": true,
+          "evidence": "It suggests two analysis sessions plus one serial implementation session."
+        }
+      ],
+      "notes": []
+    },
+    {
+      "eval_id": 5,
+      "configuration": "with_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 1.0,
+        "passed": 4,
+        "failed": 0,
+        "total": 4,
+        "time_seconds": 55.666,
+        "tokens": 2885,
+        "tool_calls": 0,
+        "errors": 0
+      },
+      "expectations": [
+        {
+          "text": "The response proposes a single isolated child task rather than a multi-task workflow.",
+          "passed": true,
+          "evidence": "It recommends organizing this as one isolated subtask rather than a multi-task flow."
+        },
+        {
+          "text": "The child task is described as doing local reading, diagnosis, modification, and re-validation in its own context.",
+          "passed": true,
+          "evidence": "It says the child process should complete local reading, failure diagnosis, necessary modification, and retry validation."
+        },
+        {
+          "text": "The response requires structured outputs such as a status file and a summary file.",
+          "passed": true,
+          "evidence": "It explicitly requires status.json, summary.md, and detailed log files."
+        },
+        {
+          "text": "The response says the main session should primarily consume the summary rather than detailed logs by default.",
+          "passed": true,
+          "evidence": "It says the main thread should only read status.json then summary.md by default and open logs only on failure."
+        }
+      ],
+      "notes": []
+    },
+    {
+      "eval_id": 1,
+      "configuration": "without_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 1.0,
+        "passed": 4,
+        "failed": 0,
+        "total": 4,
+        "time_seconds": 47.106,
+        "tokens": 564,
+        "tool_calls": 0,
+        "errors": 0
+      },
+      "expectations": [
+        {
+          "text": "The plan explicitly identifies the workflow as serial or step-gated rather than parallel.",
+          "passed": true,
+          "evidence": "The response says it will first process acorn and only after that passes will it move to avia-base."
+        },
+        {
+          "text": "The response defines at least two child tasks or steps, including one for acorn and one for avia-base.",
+          "passed": true,
+          "evidence": "It describes step 2 as handling acorn and step 3 as handling avia-base."
+        },
+        {
+          "text": "The response states that the acorn step must pass `mvn install` before proceeding.",
+          "passed": true,
+          "evidence": "It explicitly says to run `mvn clean install` in acorn and only proceed when the current step passes."
+        },
+        {
+          "text": "The response says the main session should primarily define boundaries and read summaries instead of doing detailed local analysis.",
+          "passed": true,
+          "evidence": "It says the main thread will not spread out into reading acorn/avia-base code and will default to only reading child summaries unless failure occurs."
+        }
+      ],
+      "notes": []
+    },
+    {
+      "eval_id": 2,
+      "configuration": "without_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 1.0,
+        "passed": 5,
+        "failed": 0,
+        "total": 5,
+        "time_seconds": 254.463,
+        "tokens": 1885,
+        "tool_calls": 0,
+        "errors": 0
+      },
+      "expectations": [
+        {
+          "text": "The plan explicitly identifies the work as parallel or batch-based.",
+          "passed": true,
+          "evidence": "The response says it split the work into 3 independent pi processes and ran them in parallel."
+        },
+        {
+          "text": "The response splits UserController, OrderController, and DocumentController into separate child tasks.",
+          "passed": true,
+          "evidence": "It names separate child tasks for UserController, OrderController, and DocumentController."
+        },
+        {
+          "text": "The response warns against directly modifying shared/common layers during the parallel analysis phase.",
+          "passed": true,
+          "evidence": "It says this round is analysis-only and suggests not immediately moving to unified refactoring."
+        },
+        {
+          "text": "The response requires per-task output artifacts such as status.json and summary.md.",
+          "passed": true,
+          "evidence": "It references separate child-task output summary files under the run directory."
+        },
+        {
+          "text": "The response includes a fan-in or summary step in the main session after the parallel tasks complete.",
+          "passed": true,
+          "evidence": "It says the main thread aggregated the results and then presents a consolidated conclusion."
+        }
+      ],
+      "notes": []
+    },
+    {
+      "eval_id": 3,
+      "configuration": "without_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 1.0,
+        "passed": 5,
+        "failed": 0,
+        "total": 5,
+        "time_seconds": 75.214,
+        "tokens": 2996,
+        "tool_calls": 0,
+        "errors": 0
+      },
+      "expectations": [
+        {
+          "text": "The response describes a mixed serial-plus-parallel workflow rather than a purely serial or purely parallel one.",
+          "passed": true,
+          "evidence": "It explicitly recommends a mixed flow: first serial boundary definition, then parallel review, then serial convergence."
+        },
+        {
+          "text": "The plan begins with a boundary-definition or acceptance-criteria step before the parallel analysis stage.",
+          "passed": true,
+          "evidence": "The first section defines boundary and acceptance criteria before any parallel tasks are described."
+        },
+        {
+          "text": "The response assigns controller, service, and tests to separate analysis tasks in parallel.",
+          "passed": true,
+          "evidence": "It creates three parallel tasks: controller review, service review, and BDD tests review."
+        },
+        {
+          "text": "The response includes a final serial convergence step for unified implementation or decision making.",
+          "passed": true,
+          "evidence": "It includes a third phase titled unified convergence and gives a serial implementation order."
+        },
+        {
+          "text": "The response avoids recommending concurrent modification of the same shared implementation during the parallel analysis stage.",
+          "passed": true,
+          "evidence": "It says the parallel stage should be analysis-only and that implementation should return to serial or weakly parallel execution."
+        }
+      ],
+      "notes": []
+    },
+    {
+      "eval_id": 4,
+      "configuration": "without_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 1.0,
+        "passed": 4,
+        "failed": 0,
+        "total": 4,
+        "time_seconds": 42.0,
+        "tokens": 553,
+        "tool_calls": 0,
+        "errors": 0
+      },
+      "expectations": [
+        {
+          "text": "The response explicitly rejects or advises against parallel write execution for this case.",
+          "passed": true,
+          "evidence": "It says \u201c\u4e0d\u5efa\u8bae\uff0c\u4e5f\u4e0d\u5e94\u8be5\u8fd9\u6837\u542f\u52a8\u201d."
+        },
+        {
+          "text": "The response identifies shared files, shared tests, or overlapping scope as the reason parallel execution is unsafe.",
+          "passed": true,
+          "evidence": "It points to the same PathUtil, same tests, and overlapping write scope."
+        },
+        {
+          "text": "The response does not propose launching two child tasks that both modify PathUtil or the same test files concurrently.",
+          "passed": true,
+          "evidence": "It recommends against direct parallel execution."
+        },
+        {
+          "text": "The response suggests a safer alternative, such as read-only parallel analysis or a single serial implementation task.",
+          "passed": true,
+          "evidence": "It offers either a single serial task or read-only parallel analysis followed by serial implementation."
+        }
+      ],
+      "notes": []
+    },
+    {
+      "eval_id": 5,
+      "configuration": "without_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 1.0,
+        "passed": 4,
+        "failed": 0,
+        "total": 4,
+        "time_seconds": 62.345,
+        "tokens": 2675,
+        "tool_calls": 0,
+        "errors": 0
+      },
+      "expectations": [
+        {
+          "text": "The response proposes a single isolated child task rather than a multi-task workflow.",
+          "passed": true,
+          "evidence": "It says \u201c\u53ea\u5f00\u4e00\u4e2a\u5b50\u4efb\u52a1\uff0c\u4e0d\u8981\u62c6\u6210\u591a\u4efb\u52a1\u201d."
+        },
+        {
+          "text": "The child task is described as doing local reading, diagnosis, modification, and re-validation in its own context.",
+          "passed": true,
+          "evidence": "It lists local reading, reproducing failure, diagnosis, minimal fix, and rerun validation in the child task."
+        },
+        {
+          "text": "The response requires structured outputs such as a status file and a summary file.",
+          "passed": true,
+          "evidence": "It requires status.json and summary.md with explicit schemas."
+        },
+        {
+          "text": "The response says the main session should primarily consume the summary rather than detailed logs by default.",
+          "passed": true,
+          "evidence": "It says the main thread should default to reading only status.json and summary.md and avoid full logs unless needed."
+        }
+      ],
+      "notes": []
+    }
+  ],
+  "run_summary": {
+    "with_skill": {
+      "pass_rate": {
+        "mean": 0.6,
+        "stddev": 0.5477,
+        "min": 0.0,
+        "max": 1.0
+      },
+      "time_seconds": {
+        "mean": 155.4456,
+        "stddev": 103.8163,
+        "min": 32.665,
+        "max": 261.977
+      },
+      "tokens": {
+        "mean": 1045.4,
+        "stddev": 1219.3762,
+        "min": 0,
+        "max": 2885
+      }
+    },
+    "without_skill": {
+      "pass_rate": {
+        "mean": 1.0,
+        "stddev": 0.0,
+        "min": 1.0,
+        "max": 1.0
+      },
+      "time_seconds": {
+        "mean": 96.2256,
+        "stddev": 89.417,
+        "min": 42.0,
+        "max": 254.463
+      },
+      "tokens": {
+        "mean": 1734.6,
+        "stddev": 1147.2342,
+        "min": 553,
+        "max": 2996
+      }
+    },
+    "delta": {
+      "pass_rate": "-0.40",
+      "time_seconds": "+59.2",
+      "tokens": "-689"
+    }
+  },
+  "notes": []
+}

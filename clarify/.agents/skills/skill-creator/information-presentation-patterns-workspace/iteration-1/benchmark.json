@@ -1,0 +1,59 @@
+{
+  "metadata": {
+    "skill_name": "information-presentation",
+    "skill_path": "/Users/wuke/AIGen/clarify/.claude/skills/skill-creator/information-presentation-patterns",
+    "executor_model": "claude-opus-4-6",
+    "analyzer_model": "claude-opus-4-6",
+    "timestamp": "2026-02-27T13:22:00Z",
+    "evals_run": [
+      {
+        "eval_id": 1,
+        "eval_name": "explain-order-system-code"
+      }
+    ],
+    "runs_per_configuration": 1
+  },
+  "runs": [
+    {
+      "eval_id": 1,
+      "eval_name": "explain-order-system-code",
+      "config": "with_skill",
+      "pass_rate": 1.0,
+      "passed_count": 3,
+      "total_count": 3,
+      "time_seconds": 41.4,
+      "tokens": 13282
+    },
+    {
+      "eval_id": 1,
+      "eval_name": "explain-order-system-code",
+      "config": "without_skill",
+      "pass_rate": 0.33,
+      "passed_count": 1,
+      "total_count": 3,
+      "time_seconds": 44.3,
+      "tokens": 13481
+    }
+  ],
+  "run_summary": {
+    "delta": {
+      "pass_rate": "+0.67",
+      "time_seconds": "-2.9",
+      "tokens": "-199"
+    },
+    "with_skill": {
+      "pass_rate": "1.00",
+      "time_seconds": "41.4",
+      "tokens": "13282"
+    },
+    "without_skill": {
+      "pass_rate": "0.33",
+      "time_seconds": "44.3",
+      "tokens": "13481"
+    }
+  },
+  "notes": [
+    "带skill版本使用了流程图和结构化文本展示订单状态流转和折扣规则",
+    "不带skill版本只使用纯文字描述，缺少可视化表示"
+  ]
+}

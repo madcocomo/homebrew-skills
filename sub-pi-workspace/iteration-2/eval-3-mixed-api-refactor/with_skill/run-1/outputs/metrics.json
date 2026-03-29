@@ -1,0 +1,11 @@
+{
+  "label": "with-skill",
+  "provider": "openai-codex",
+  "model": "gpt-5.4",
+  "total_tokens": 11158,
+  "output_chars": 3859,
+  "errors_encountered": 0,
+  "files_created": [
+    "/Users/wuke/code/AH/.claude/skills/sub-pi-workspace/iteration-2/eval-3-mixed-api-refactor/with_skill/outputs/final-response.md"
+  ]
+}

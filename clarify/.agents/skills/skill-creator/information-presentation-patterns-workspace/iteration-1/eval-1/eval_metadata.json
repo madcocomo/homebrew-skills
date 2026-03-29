@@ -1,0 +1,22 @@
+{
+  "eval_id": 1,
+  "eval_name": "explain-order-system-code",
+  "prompt": "用户给你一个Python文件（路径：iteration-1/eval-1-order-system.py），里面是一个电商订单处理系统的代码，包含订单创建、支付、发货、退款等逻辑。请向用户解释这段代码的实现逻辑和工作流程。",
+  "assertions": [
+    {
+      "text": "使用了状态机模式或流程图展示订单状态流转",
+      "passed": null,
+      "evidence": ""
+    },
+    {
+      "text": "使用了表格展示折扣规则",
+      "passed": null,
+      "evidence": ""
+    },
+    {
+      "text": "展示了完整的工作流程",
+      "passed": null,
+      "evidence": ""
+    }
+  ]
+}

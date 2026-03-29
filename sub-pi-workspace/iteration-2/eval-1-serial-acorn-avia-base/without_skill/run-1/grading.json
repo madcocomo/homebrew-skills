@@ -1,0 +1,40 @@
+{
+  "expectations": [
+    {
+      "text": "The plan explicitly identifies the workflow as serial or step-gated rather than parallel.",
+      "passed": true,
+      "evidence": "It says it will first process acorn and only after that passes will it move to avia-base."
+    },
+    {
+      "text": "The response defines at least two child tasks or steps, including one for acorn and one for avia-base.",
+      "passed": true,
+      "evidence": "It defines Step 1 acorn and Step 2 avia-base child processes."
+    },
+    {
+      "text": "The response states that the acorn step must pass `mvn install` before proceeding.",
+      "passed": true,
+      "evidence": "It names `mvn clean install` as the gate before proceeding."
+    },
+    {
+      "text": "The response says the main session should primarily define boundaries and read summaries instead of doing detailed local analysis.",
+      "passed": true,
+      "evidence": "It says the main thread only handles orchestration and reads child summaries."
+    }
+  ],
+  "summary": {
+    "passed": 4,
+    "failed": 0,
+    "total": 4,
+    "pass_rate": 1.0
+  },
+  "timing": {
+    "total_duration_seconds": 29.204,
+    "total_tokens": 5021
+  },
+  "execution_metrics": {
+    "total_tool_calls": 0,
+    "errors_encountered": 0,
+    "output_chars": 568,
+    "transcript_chars": 0
+  }
+}

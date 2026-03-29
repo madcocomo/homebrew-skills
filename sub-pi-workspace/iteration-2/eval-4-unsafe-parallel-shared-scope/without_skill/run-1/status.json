@@ -1,0 +1,9 @@
+{
+  "success": true,
+  "label": "without-skill",
+  "return_code": 0,
+  "summaryFile": "/Users/wuke/code/AH/.claude/skills/sub-pi-workspace/iteration-2/eval-4-unsafe-parallel-shared-scope/without_skill/outputs/final-response.md",
+  "rawResultFile": "/Users/wuke/code/AH/.claude/skills/sub-pi-workspace/iteration-2/eval-4-unsafe-parallel-shared-scope/without_skill/result.jsonl",
+  "stderrFile": "/Users/wuke/code/AH/.claude/skills/sub-pi-workspace/iteration-2/eval-4-unsafe-parallel-shared-scope/without_skill/stderr.log",
+  "timingFile": "/Users/wuke/code/AH/.claude/skills/sub-pi-workspace/iteration-2/eval-4-unsafe-parallel-shared-scope/without_skill/timing.json"
+}

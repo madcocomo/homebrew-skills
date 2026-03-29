@@ -1,0 +1,10 @@
+{
+  "total_tokens": 10922,
+  "duration_ms": 60066,
+  "total_duration_seconds": 60.067,
+  "provider": "openai-codex",
+  "model": "gpt-5.4",
+  "start_ms": 1772935801964,
+  "end_ms": 1772935862030,
+  "return_code": 0
+}

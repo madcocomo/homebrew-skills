@@ -1,0 +1,40 @@
+{
+  "expectations": [
+    {
+      "text": "The response explicitly rejects or advises against parallel write execution for this case.",
+      "passed": true,
+      "evidence": "It says “不建议，也不应该这样启动”."
+    },
+    {
+      "text": "The response identifies shared files, shared tests, or overlapping scope as the reason parallel execution is unsafe.",
+      "passed": true,
+      "evidence": "It points to the same PathUtil, same tests, and overlapping write scope."
+    },
+    {
+      "text": "The response does not propose launching two child tasks that both modify PathUtil or the same test files concurrently.",
+      "passed": true,
+      "evidence": "It recommends against direct parallel execution."
+    },
+    {
+      "text": "The response suggests a safer alternative, such as read-only parallel analysis or a single serial implementation task.",
+      "passed": true,
+      "evidence": "It offers either a single serial task or read-only parallel analysis followed by serial implementation."
+    }
+  ],
+  "summary": {
+    "passed": 4,
+    "failed": 0,
+    "total": 4,
+    "pass_rate": 1.0
+  },
+  "timing": {
+    "total_duration_seconds": 42.0,
+    "total_tokens": 13614
+  },
+  "execution_metrics": {
+    "total_tool_calls": 0,
+    "errors_encountered": 0,
+    "output_chars": 553,
+    "transcript_chars": 0
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "label": "without-skill",
+  "provider": "openai-codex",
+  "model": "gpt-5.4",
+  "total_tokens": 20125,
+  "output_chars": 2331,
+  "errors_encountered": 0,
+  "files_created": [
+    "/Users/wuke/code/AH/.claude/skills/sub-pi-workspace/iteration-2/eval-2-parallel-controller-review/without_skill/outputs/final-response.md"
+  ]
+}

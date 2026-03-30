@@ -7,10 +7,12 @@
  * - /run-summary
  * - /run-promote-docs
  * - /run-stop
+ * - /run-merge
  */
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { access, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { constants } from "node:fs";
+import { tmpdir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 
 type RepoBranch = {
@@ -68,6 +70,59 @@ type StatusData = Partial<RunModelSnapshot> & {
 type RepoCandidate = {
   name: string;
   root: string;
+};
+
+type GitCommandResult = {
+  code: number;
+  stdout: string;
+  stderr: string;
+};
+
+export type GitRunner = (repoRoot: string, args: string[]) => Promise<GitCommandResult>;
+
+type RepoBranchObservation = {
+  repoName: string;
+  currentBranch: string;
+  trunkBranch?: string;
+};
+
+export type MergeScopeRepo = {
+  name: string;
+  root: string;
+  sourceBranch: string;
+  targetBranch: string;
+  currentBranch: string;
+  dirty: boolean;
+  detached: boolean;
+};
+
+export type MergeScope = {
+  sourceBranch: string;
+  repos: MergeScopeRepo[];
+  requiresConfirmation: boolean;
+  confirmationMessage?: string;
+};
+
+type CommitPlanEntry = {
+  message: string;
+  files?: string[];
+};
+
+export type CommitPlan = {
+  strategy: "squash" | "atomic";
+  commits: CommitPlanEntry[];
+};
+
+export type MergePreview = {
+  status: "clean" | "conflict" | "noop";
+  repo: Pick<MergeScopeRepo, "name" | "root" | "sourceBranch" | "targetBranch">;
+  targetHead: string;
+  mergeBase: string;
+  changedFiles: string[];
+  commitSubjects: string[];
+  tempDir?: string;
+  tempBranch?: string;
+  conflictFiles?: string[];
 };
 
 export type PlanCommandContext = Pick<ExtensionContext, "cwd" | "hasUI" | "ui">;
@@ -472,6 +527,497 @@ export async function parseRunPlanArgs(rawArgs: string, ctx: PlanCommandContext)
   }
 
   throw lastError ?? new PlanResolutionError("not-found", buildNoMatchMessage(normalizedArgs));
+}
+
+function splitLines(value: string): string[] {
+  return value.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+}
+
+function firstPathSegment(path: string): string {
+  const normalized = path.replace(/^\.\//, "").replace(/^\//, "");
+  const [segment] = normalized.split("/");
+  return segment || normalized;
+}
+
+function slugFragment(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/\.[^.]+$/, "")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 24) || "tmp";
+}
+
+function stripOriginPrefix(value: string): string {
+  return value.startsWith("origin/") ? value.slice("origin/".length) : value;
+}
+
+function stripPlanSuffix(value: string): string {
+  return value
+    .replace(/^#+\s*/, "")
+    .replace(/[\[\]]/g, "")
+    .replace(/\bimplementation\s+plan\b$/i, "")
+    .replace(/\bdesign\b$/i, "")
+    .trim();
+}
+
+function normalizeSubjectText(value: string): string {
+  return value
+    .replace(/`/g, "")
+    .replace(/\/(\w+)/g, "$1")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
+function inferCommitType(subject: string): string {
+  if (/^(feat|fix|docs|refactor|test|chore):\s/i.test(subject)) {
+    return subject.split(":", 1)[0].toLowerCase();
+  }
+  if (/\b(fix|bug|repair|correct)\b/i.test(subject)) return "fix";
+  if (/\b(doc|readme)\b/i.test(subject)) return "docs";
+  if (/\b(refactor|cleanup)\b/i.test(subject)) return "refactor";
+  if (/\b(test|spec)\b/i.test(subject)) return "test";
+  return "feat";
+}
+
+function planTitleSubject(title?: string): string | undefined {
+  if (!title) return undefined;
+  const stripped = normalizeSubjectText(stripPlanSuffix(title));
+  if (!stripped) return undefined;
+  return /^(add|fix|update|improve|refactor|document)\b/.test(stripped) ? stripped : `add ${stripped}`;
+}
+
+function goalSubject(goal?: string): string | undefined {
+  if (!goal) return undefined;
+  const sentence = normalizeSubjectText(goal.split(/[.。]/, 1)[0] ?? goal);
+  return sentence || undefined;
+}
+
+function fileSubject(planFile?: string): string | undefined {
+  if (!planFile) return undefined;
+  const base = basename(planFile).replace(/\.[^.]+$/, "");
+  const topic = normalizeSubjectText(base.replace(/^\d{4}-\d{2}-\d{2}-/, "").replace(/-/g, " "));
+  return topic ? `add ${topic}` : undefined;
+}
+
+export function chooseDefaultBranch(input: { originHead?: string; localBranches: string[] }): string | undefined {
+  const remote = input.originHead ? stripOriginPrefix(input.originHead.trim()) : undefined;
+  if (remote) return remote;
+  for (const candidate of ["main", "master", "trunk"]) {
+    if (input.localBranches.includes(candidate)) return candidate;
+  }
+  return undefined;
+}
+
+export function inferTaskBranchFromStates(states: RepoBranchObservation[]): {
+  branchName?: string;
+  requiresConfirmation: boolean;
+  matchedRepoNames: string[];
+  branchCounts: Record<string, number>;
+} {
+  const branchCounts: Record<string, number> = {};
+  for (const state of states) {
+    if (!state.currentBranch || state.currentBranch === state.trunkBranch) continue;
+    branchCounts[state.currentBranch] = (branchCounts[state.currentBranch] ?? 0) + 1;
+  }
+
+  const ranked = Object.entries(branchCounts).sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]));
+  const branchName = ranked[0]?.[0];
+  if (!branchName) {
+    return { branchName: undefined, requiresConfirmation: false, matchedRepoNames: [], branchCounts };
+  }
+
+  const matchedRepoNames = states.filter((state) => state.currentBranch === branchName).map((state) => state.repoName);
+  const distinctBranches = new Set(states.map((state) => state.currentBranch));
+  return {
+    branchName,
+    requiresConfirmation: distinctBranches.size > 1,
+    matchedRepoNames,
+    branchCounts,
+  };
+}
+
+export function buildMergeCommitMessage(input: {
+  planTitle?: string;
+  goal?: string;
+  planFile?: string;
+  commitSubjects?: string[];
+  sourceBranch: string;
+  targetBranch: string;
+}): string {
+  const firstSubject = input.commitSubjects?.find((subject) => subject.trim());
+  const planSubject = planTitleSubject(input.planTitle)
+    ?? goalSubject(input.goal)
+    ?? fileSubject(input.planFile);
+  if (planSubject) {
+    return `${inferCommitType(planSubject)}: ${planSubject.replace(/^(feat|fix|docs|refactor|test|chore):\s*/i, "").trim()}`;
+  }
+  if (firstSubject && /^(feat|fix|docs|refactor|test|chore):\s/i.test(firstSubject)) {
+    return firstSubject.trim();
+  }
+
+  const rawSubject = (firstSubject ? normalizeSubjectText(firstSubject) : undefined)
+    ?? `merge ${normalizeSubjectText(input.sourceBranch)} back to ${normalizeSubjectText(input.targetBranch)}`;
+
+  const cleanSubject = rawSubject.replace(/^(feat|fix|docs|refactor|test|chore):\s*/i, "").trim();
+  return `${inferCommitType(rawSubject)}: ${cleanSubject}`;
+}
+
+export function buildCommitPlan(input: {
+  changedFiles: string[];
+  commitSubjects: string[];
+  fallbackMessage: string;
+}): CommitPlan {
+  const groups = new Map<string, string[]>();
+  const order: string[] = [];
+  for (const file of input.changedFiles) {
+    const key = firstPathSegment(file);
+    if (!groups.has(key)) {
+      groups.set(key, []);
+      order.push(key);
+    }
+    groups.get(key)?.push(file);
+  }
+
+  const hasTestGroup = order.some((key) => key === "test" || key === "tests");
+  const canSplit = order.length >= 2
+    && order.length <= 4
+    && input.commitSubjects.length === order.length
+    && !hasTestGroup;
+
+  if (!canSplit) {
+    return { strategy: "squash", commits: [{ message: input.fallbackMessage }] };
+  }
+
+  return {
+    strategy: "atomic",
+    commits: order.map((key, index) => ({
+      message: input.commitSubjects[index] ?? input.fallbackMessage,
+      files: groups.get(key) ?? [],
+    })),
+  };
+}
+
+async function readGitOutput(git: GitRunner, repoRoot: string, args: string[], label: string): Promise<string> {
+  const result = await git(repoRoot, args);
+  if (result.code !== 0) {
+    throw new Error(`${label}: ${result.stderr || result.stdout || args.join(" ")}`);
+  }
+  return result.stdout.trim();
+}
+
+async function detectWorkspaceRepos(root: string, git: GitRunner): Promise<RepoCandidate[]> {
+  const dirs = [root];
+  try {
+    const entries = await readdir(root, { withFileTypes: true });
+    for (const entry of entries) {
+      if (entry.isDirectory() && !entry.name.startsWith(".")) {
+        dirs.push(join(root, entry.name));
+      }
+    }
+  } catch {
+    // ignore directory scan failures
+  }
+
+  const seen = new Set<string>();
+  const repos: RepoCandidate[] = [];
+  for (const dir of dirs) {
+    const result = await git(dir, ["rev-parse", "--show-toplevel"]);
+    if (result.code !== 0) continue;
+    const repoRoot = result.stdout.trim();
+    if (!repoRoot || seen.has(repoRoot)) continue;
+    seen.add(repoRoot);
+    repos.push({ name: basename(repoRoot), root: repoRoot });
+  }
+  return repos.sort((left, right) => left.root.localeCompare(right.root));
+}
+
+async function detectRepoState(
+  git: GitRunner,
+  repo: RepoCandidate,
+  targetBranch?: string,
+): Promise<Omit<MergeScopeRepo, "sourceBranch"> & { trunkBranch?: string }> {
+  const currentBranch = await readGitOutput(git, repo.root, ["rev-parse", "--abbrev-ref", "HEAD"], `Cannot determine branch for ${repo.root}`);
+  const dirty = (await readGitOutput(git, repo.root, ["status", "--porcelain"], `Cannot read status for ${repo.root}`)).length > 0;
+  const originHeadResult = await git(repo.root, ["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"]);
+  const branchList = splitLines(await readGitOutput(git, repo.root, ["for-each-ref", "--format=%(refname:short)", "refs/heads"], `Cannot list branches for ${repo.root}`));
+  const trunkBranch = targetBranch ?? chooseDefaultBranch({
+    originHead: originHeadResult.code === 0 ? originHeadResult.stdout.trim() : undefined,
+    localBranches: branchList,
+  });
+
+  return {
+    name: repo.name,
+    root: repo.root,
+    currentBranch,
+    targetBranch: trunkBranch ?? "",
+    dirty,
+    detached: currentBranch === "HEAD",
+    trunkBranch,
+  };
+}
+
+function buildScopeConfirmationMessage(branchName: string, repos: Array<{ name: string; currentBranch: string; targetBranch: string }>): string {
+  const repoLines = repos.map((repo) => `- ${repo.name}: ${repo.currentBranch} -> ${repo.targetBranch}`).join("\n");
+  return [
+    `Detected mixed branch states. Use ${branchName} as the task branch?`,
+    repoLines,
+  ].join("\n");
+}
+
+export async function resolveRunMergeScope(input: {
+  cwd: string;
+  git: GitRunner;
+  activeRun?: Pick<RunState, "branchName" | "repos">;
+}): Promise<MergeScope> {
+  if (input.activeRun) {
+    const repos = await Promise.all(input.activeRun.repos.map(async (repo) => {
+      const state = await detectRepoState(input.git, { name: repo.name, root: repo.root }, repo.previousBranch);
+      return {
+        ...state,
+        sourceBranch: input.activeRun!.branchName,
+        targetBranch: repo.previousBranch,
+      };
+    }));
+    return { sourceBranch: input.activeRun.branchName, repos, requiresConfirmation: false };
+  }
+
+  const repos = await detectWorkspaceRepos(input.cwd, input.git);
+  if (repos.length === 0) {
+    throw new Error("No git repos found in the current workspace.");
+  }
+
+  const currentRepoResult = await input.git(input.cwd, ["rev-parse", "--show-toplevel"]);
+  const states = await Promise.all(repos.map((repo) => detectRepoState(input.git, repo)));
+  if (currentRepoResult.code === 0) {
+    const currentRoot = currentRepoResult.stdout.trim();
+    const currentRepo = states.find((repo) => repo.root === currentRoot);
+    if (!currentRepo) {
+      throw new Error(`Current repo ${currentRoot} is outside the detected workspace repos.`);
+    }
+    if (!currentRepo.currentBranch || currentRepo.currentBranch === currentRepo.trunkBranch) {
+      throw new Error(`Current branch ${currentRepo.currentBranch} is already the trunk branch.`);
+    }
+    return {
+      sourceBranch: currentRepo.currentBranch,
+      requiresConfirmation: false,
+      repos: states
+        .filter((repo) => repo.currentBranch === currentRepo.currentBranch)
+        .map((repo) => ({ ...repo, sourceBranch: currentRepo.currentBranch })),
+    };
+  }
+
+  const inferred = inferTaskBranchFromStates(states.map((repo) => ({
+    repoName: repo.name,
+    currentBranch: repo.currentBranch,
+    trunkBranch: repo.trunkBranch,
+  })));
+  if (!inferred.branchName) {
+    throw new Error("Could not infer a task branch from the current workspace.");
+  }
+
+  const matchedRepos = states.filter((repo) => repo.currentBranch === inferred.branchName);
+  return {
+    sourceBranch: inferred.branchName,
+    requiresConfirmation: inferred.requiresConfirmation,
+    confirmationMessage: inferred.requiresConfirmation
+      ? buildScopeConfirmationMessage(inferred.branchName, matchedRepos)
+      : undefined,
+    repos: matchedRepos.map((repo) => ({ ...repo, sourceBranch: inferred.branchName! })),
+  };
+}
+
+function tempBranchName(repo: Pick<MergeScopeRepo, "name" | "sourceBranch">): string {
+  return `pi-merge-${slugFragment(repo.name)}-${Date.now().toString(36)}`;
+}
+
+async function createPreviewWorktree(git: GitRunner, repo: MergeScopeRepo): Promise<{ tempDir: string; tempBranch: string }> {
+  const tempDir = await mkdtemp(join(tmpdir(), `plan-runner-${slugFragment(repo.name)}-`));
+  const tempBranch = tempBranchName(repo);
+  const addResult = await git(repo.root, ["worktree", "add", "-b", tempBranch, tempDir, repo.targetBranch]);
+  if (addResult.code !== 0) {
+    await rm(tempDir, { recursive: true, force: true });
+    throw new Error(`Failed to create merge worktree for ${repo.name}: ${addResult.stderr || addResult.stdout}`);
+  }
+  return { tempDir, tempBranch };
+}
+
+async function mergeCommitSubjects(git: GitRunner, repo: MergeScopeRepo, mergeBase: string): Promise<string[]> {
+  const log = await readGitOutput(git, repo.root, ["log", "--format=%s", `${mergeBase}..${repo.sourceBranch}`], `Cannot read commit subjects for ${repo.name}`);
+  return splitLines(log);
+}
+
+async function mergeConflictFiles(git: GitRunner, tempDir: string): Promise<string[]> {
+  const result = await git(tempDir, ["diff", "--name-only", "--diff-filter=U"]);
+  return splitLines(result.stdout || "");
+}
+
+export async function cleanupMergePreview(git: GitRunner, preview: MergePreview): Promise<void> {
+  if (!preview.tempDir || !preview.tempBranch) return;
+  await git(preview.repo.root, ["worktree", "remove", "--force", preview.tempDir]);
+  await git(preview.repo.root, ["branch", "-D", preview.tempBranch]);
+  await rm(preview.tempDir, { recursive: true, force: true });
+}
+
+export async function previewMergeTarget(git: GitRunner, repo: MergeScopeRepo): Promise<MergePreview> {
+  const targetHead = await readGitOutput(git, repo.root, ["rev-parse", repo.targetBranch], `Cannot resolve ${repo.targetBranch}`);
+  const sourceHead = await readGitOutput(git, repo.root, ["rev-parse", repo.sourceBranch], `Cannot resolve ${repo.sourceBranch}`);
+  const mergeBase = await readGitOutput(git, repo.root, ["merge-base", repo.targetBranch, repo.sourceBranch], `Cannot compute merge base for ${repo.name}`);
+  const commitSubjects = await mergeCommitSubjects(git, repo, mergeBase);
+  if (mergeBase === sourceHead) {
+    return { status: "noop", repo, targetHead, mergeBase, changedFiles: [], commitSubjects };
+  }
+
+  const { tempDir, tempBranch } = await createPreviewWorktree(git, repo);
+  const mergeResult = await git(tempDir, ["merge", "--squash", "--no-commit", repo.sourceBranch]);
+  if (mergeResult.code !== 0) {
+    const conflictFiles = await mergeConflictFiles(git, tempDir);
+    await git(tempDir, ["reset", "--hard", "HEAD"]);
+    const preview: MergePreview = {
+      status: "conflict",
+      repo,
+      targetHead,
+      mergeBase,
+      changedFiles: [],
+      commitSubjects,
+      tempDir,
+      tempBranch,
+      conflictFiles,
+    };
+    await cleanupMergePreview(git, preview);
+    return { ...preview, tempDir: undefined, tempBranch: undefined };
+  }
+
+  const changedFiles = splitLines(await readGitOutput(git, tempDir, ["diff", "--cached", "--name-only"], `Cannot inspect merge preview for ${repo.name}`));
+  if (changedFiles.length === 0) {
+    const preview: MergePreview = { status: "noop", repo, targetHead, mergeBase, changedFiles, commitSubjects, tempDir, tempBranch };
+    await cleanupMergePreview(git, preview);
+    return { ...preview, tempDir: undefined, tempBranch: undefined };
+  }
+
+  return { status: "clean", repo, targetHead, mergeBase, changedFiles, commitSubjects, tempDir, tempBranch };
+}
+
+async function commitAllChanges(git: GitRunner, tempDir: string, message: string): Promise<string> {
+  const commitResult = await git(tempDir, ["commit", "-m", message]);
+  if (commitResult.code !== 0) {
+    throw new Error(commitResult.stderr || commitResult.stdout || `Failed to commit ${message}`);
+  }
+  return readGitOutput(git, tempDir, ["rev-parse", "HEAD"], "Cannot read merge commit id");
+}
+
+export async function applyMergeTarget(
+  git: GitRunner,
+  repo: MergeScopeRepo,
+  preview: MergePreview,
+  plan: CommitPlan,
+): Promise<{ status: "merged" | "noop"; strategy: CommitPlan["strategy"]; commitIds: string[] }> {
+  if (preview.status === "noop") {
+    return { status: "noop", strategy: plan.strategy, commitIds: [] };
+  }
+  if (preview.status !== "clean" || !preview.tempDir || !preview.tempBranch) {
+    throw new Error(`Cannot apply merge for ${repo.name} from preview status ${preview.status}.`);
+  }
+
+  try {
+    const commitIds: string[] = [];
+    if (plan.strategy === "atomic") {
+      const resetResult = await git(preview.tempDir, ["reset"]);
+      if (resetResult.code !== 0) {
+        throw new Error(resetResult.stderr || resetResult.stdout || `Failed to unstage merge changes for ${repo.name}`);
+      }
+      for (const commit of plan.commits) {
+        const addResult = await git(preview.tempDir, ["add", "--", ...(commit.files ?? [])]);
+        if (addResult.code !== 0) {
+          throw new Error(addResult.stderr || addResult.stdout || `Failed to stage files for ${repo.name}`);
+        }
+        commitIds.push(await commitAllChanges(git, preview.tempDir, commit.message));
+      }
+    } else {
+      commitIds.push(await commitAllChanges(git, preview.tempDir, plan.commits[0]?.message ?? `chore: merge ${repo.sourceBranch}`));
+    }
+
+    const moveResult = await git(repo.root, ["branch", "-f", repo.targetBranch, preview.tempBranch]);
+    if (moveResult.code !== 0) {
+      throw new Error(moveResult.stderr || moveResult.stdout || `Failed to update ${repo.targetBranch} for ${repo.name}`);
+    }
+    return { status: "merged", strategy: plan.strategy, commitIds };
+  } finally {
+    await cleanupMergePreview(git, preview);
+  }
+}
+
+export async function writeMergeReceipt(
+  run: Pick<RunState, "runId" | "runDir" | "branchName">,
+  result: { strategy: CommitPlan["strategy"]; repos: Array<Record<string, unknown>> },
+): Promise<string> {
+  const receiptPath = join(run.runDir, "merge-result.json");
+  await writeFile(receiptPath, `${JSON.stringify({
+    runId: run.runId,
+    branchName: run.branchName,
+    completedAt: new Date().toISOString(),
+    strategy: result.strategy,
+    repos: result.repos,
+  }, null, 2)}\n`, "utf8");
+  return receiptPath;
+}
+
+async function readPlanDetails(planFile?: string): Promise<{ title?: string; goal?: string }> {
+  if (!planFile || !(await exists(planFile))) return {};
+  const text = await readFile(planFile, "utf8");
+  const lines = text.split(/\r?\n/);
+  const title = lines.find((line) => line.startsWith("# "))?.replace(/^#\s+/, "").trim();
+  const goalLine = lines.find((line) => line.startsWith("**Goal:**"));
+  return {
+    title,
+    goal: goalLine?.replace(/^\*\*Goal:\*\*\s*/, "").trim(),
+  };
+}
+
+function gitRunnerFromPi(pi: ExtensionAPI): GitRunner {
+  return async (repoRoot, args) => {
+    const result = await pi.exec("git", ["-C", repoRoot, ...args]);
+    return {
+      code: result.code,
+      stdout: result.stdout ?? "",
+      stderr: result.stderr ?? "",
+    };
+  };
+}
+
+function ensureMergeReady(scope: MergeScope): void {
+  if (scope.repos.length === 0) {
+    throw new Error("No repos are eligible for merge.");
+  }
+  for (const repo of scope.repos) {
+    if (repo.detached) {
+      throw new Error(`${repo.name} is on a detached HEAD.`);
+    }
+    if (repo.dirty) {
+      throw new Error(`${repo.name} has uncommitted changes.`);
+    }
+    if (!repo.targetBranch) {
+      throw new Error(`Cannot determine trunk branch for ${repo.name}.`);
+    }
+  }
+}
+
+function buildConflictMessage(preview: MergePreview): string {
+  const files = preview.conflictFiles?.length ? `\nFiles: ${preview.conflictFiles.join(", ")}` : "";
+  return [
+    `${preview.repo.name} conflicted while merging ${preview.repo.sourceBranch} into ${preview.repo.targetBranch}.`,
+    "I can't safely decide how to resolve this automatically.",
+    "Merge trunk into the task branch and verify there first?",
+    files,
+  ].join("\n");
+}
+
+function buildMergeSummary(results: Array<{ name: string; status: string; targetBranch: string; commitIds: string[] }>): string {
+  return results.map((result) => {
+    const commits = result.commitIds.length > 0 ? ` (${result.commitIds.join(", ")})` : "";
+    return `- ${result.name}: ${result.status} -> ${result.targetBranch}${commits}`;
+  }).join("\n");
 }
 
 export default function planRunnerExtension(pi: ExtensionAPI) {
@@ -947,6 +1493,122 @@ export default function planRunnerExtension(pi: ExtensionAPI) {
       }
       await refreshStatus(ctx);
       await renderSummaryMessage(activeRun);
+    },
+  });
+
+  pi.registerCommand("run-merge", {
+    description: "Merge the current task branch back to trunk",
+    handler: async (_args, ctx) => {
+      if (activeRun && await tmuxSessionExists(activeRun.tmuxSession)) {
+        ctx.ui.notify("The current run is still active. Wait for it to finish before merging.", "warning");
+        return;
+      }
+
+      const git = gitRunnerFromPi(pi);
+      const pendingPreviews = new Map<string, MergePreview>();
+      try {
+        const scope = await resolveRunMergeScope({
+          cwd: ctx.cwd,
+          git,
+          activeRun: activeRun ? { branchName: activeRun.branchName, repos: activeRun.repos } : undefined,
+        });
+        ensureMergeReady(scope);
+
+        if (scope.requiresConfirmation) {
+          if (!ctx.hasUI) {
+            throw new Error(scope.confirmationMessage ?? "User confirmation is required before merging.");
+          }
+          const confirmed = await ctx.ui.confirm("Confirm merge scope?", scope.confirmationMessage ?? "Continue with this merge scope?");
+          if (!confirmed) {
+            ctx.ui.notify("Merge cancelled.", "info");
+            return;
+          }
+        }
+
+        const planDetails = await readPlanDetails(activeRun?.planFile);
+        const results: Array<{ name: string; status: string; targetBranch: string; commitIds: string[]; strategy?: CommitPlan["strategy"] }> = [];
+        for (const repo of scope.repos) {
+          const preview = await previewMergeTarget(git, repo);
+          if (preview.status === "conflict") {
+            const message = buildConflictMessage(preview);
+            if (ctx.hasUI) {
+              const confirmed = await ctx.ui.confirm("Merge conflict detected", message);
+              ctx.ui.notify(
+                confirmed
+                  ? "Please merge trunk into the task branch, verify there, then run /run-merge again."
+                  : "Merge stopped due to conflicts.",
+                confirmed ? "warning" : "info",
+              );
+            } else {
+              throw new Error(message);
+            }
+            return;
+          }
+          if (preview.status === "noop") {
+            results.push({ name: repo.name, status: "noop", targetBranch: repo.targetBranch, commitIds: [] });
+            continue;
+          }
+          if (preview.tempDir) {
+            pendingPreviews.set(preview.tempDir, preview);
+          }
+        }
+
+        for (const preview of pendingPreviews.values()) {
+          const fallbackMessage = buildMergeCommitMessage({
+            planTitle: planDetails.title,
+            goal: planDetails.goal,
+            planFile: activeRun?.planFile,
+            commitSubjects: preview.commitSubjects,
+            sourceBranch: preview.repo.sourceBranch,
+            targetBranch: preview.repo.targetBranch,
+          });
+          const plan = buildCommitPlan({
+            changedFiles: preview.changedFiles,
+            commitSubjects: preview.commitSubjects,
+            fallbackMessage,
+          });
+          const applyResult = await applyMergeTarget(git, scope.repos.find((repo) => repo.root === preview.repo.root) ?? {
+            ...preview.repo,
+            currentBranch: preview.repo.sourceBranch,
+            dirty: false,
+            detached: false,
+          }, preview, plan);
+          pendingPreviews.delete(preview.tempDir ?? "");
+          results.push({
+            name: preview.repo.name,
+            status: applyResult.status,
+            targetBranch: preview.repo.targetBranch,
+            commitIds: applyResult.commitIds,
+            strategy: applyResult.strategy,
+          });
+        }
+
+        if (activeRun) {
+          await writeMergeReceipt(activeRun, {
+            strategy: results.some((result) => result.strategy === "atomic") ? "atomic" : "squash",
+            repos: results.map((result) => ({
+              name: result.name,
+              root: scope.repos.find((repo) => repo.name === result.name)?.root,
+              sourceBranch: scope.sourceBranch,
+              targetBranch: result.targetBranch,
+              status: result.status,
+              commitIds: result.commitIds,
+            })),
+          });
+        }
+
+        const summary = buildMergeSummary(results);
+        if (ctx.hasUI) {
+          ctx.ui.notify(`Merged ${scope.sourceBranch}\n${summary}`, "success");
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        ctx.ui.notify(message, "error");
+      } finally {
+        for (const preview of pendingPreviews.values()) {
+          await cleanupMergePreview(git, preview);
+        }
+      }
     },
   });
 

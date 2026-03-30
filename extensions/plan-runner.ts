@@ -169,6 +169,7 @@ class PlanResolutionError extends Error {
 const STATE_ENTRY = "plan-runner-state";
 const STATUS_ID = "plan-runner";
 const POLL_MS = 3000;
+const ACTIVE_RUN_STATES = new Set(["preparing", "running", "verifying"]);
 
 export function normalizePathArg(raw: string): string {
   return raw.trim().replace(/^@/, "");
@@ -770,8 +771,9 @@ export async function resolveRunMergeScope(input: {
   cwd: string;
   git: GitRunner;
   activeRun?: Pick<RunState, "branchName" | "repos">;
+  activeRunState?: string;
 }): Promise<MergeScope> {
-  if (input.activeRun) {
+  if (input.activeRun && (input.activeRunState === undefined || ACTIVE_RUN_STATES.has(input.activeRunState))) {
     const repos = await Promise.all(input.activeRun.repos.map(async (repo) => {
       const state = await detectRepoState(input.git, { name: repo.name, root: repo.root }, repo.previousBranch);
       return {
@@ -1499,18 +1501,37 @@ export default function planRunnerExtension(pi: ExtensionAPI) {
   pi.registerCommand("run-merge", {
     description: "Merge the current task branch back to trunk",
     handler: async (_args, ctx) => {
-      if (activeRun && await tmuxSessionExists(activeRun.tmuxSession)) {
-        ctx.ui.notify("The current run is still active. Wait for it to finish before merging.", "warning");
-        return;
+      const git = gitRunnerFromPi(pi);
+      let mergeRun: RunState | undefined;
+      let mergeRunState: string | undefined;
+
+      if (activeRun) {
+        const running = await tmuxSessionExists(activeRun.tmuxSession);
+        if (running) {
+          ctx.ui.notify("The current run is still active. Wait for it to finish before merging.", "warning");
+          return;
+        }
+
+        try {
+          const { derivedState } = await currentStatus();
+          mergeRunState = derivedState;
+        } catch {
+          mergeRunState = activeRun.lastKnownState;
+        }
+
+        if (mergeRunState && ACTIVE_RUN_STATES.has(mergeRunState)) {
+          ctx.ui.notify("The current run is still active. Wait for it to finish before merging.", "warning");
+          return;
+        }
       }
 
-      const git = gitRunnerFromPi(pi);
       const pendingPreviews = new Map<string, MergePreview>();
       try {
         const scope = await resolveRunMergeScope({
           cwd: ctx.cwd,
           git,
-          activeRun: activeRun ? { branchName: activeRun.branchName, repos: activeRun.repos } : undefined,
+          activeRun: mergeRun ? { branchName: mergeRun.branchName, repos: mergeRun.repos } : undefined,
+          activeRunState: mergeRunState,
         });
         ensureMergeReady(scope);
 
@@ -1525,7 +1546,7 @@ export default function planRunnerExtension(pi: ExtensionAPI) {
           }
         }
 
-        const planDetails = await readPlanDetails(activeRun?.planFile);
+        const planDetails = await readPlanDetails(mergeRun?.planFile);
         const results: Array<{ name: string; status: string; targetBranch: string; commitIds: string[]; strategy?: CommitPlan["strategy"] }> = [];
         for (const repo of scope.repos) {
           const preview = await previewMergeTarget(git, repo);
@@ -1557,7 +1578,7 @@ export default function planRunnerExtension(pi: ExtensionAPI) {
           const fallbackMessage = buildMergeCommitMessage({
             planTitle: planDetails.title,
             goal: planDetails.goal,
-            planFile: activeRun?.planFile,
+            planFile: mergeRun?.planFile,
             commitSubjects: preview.commitSubjects,
             sourceBranch: preview.repo.sourceBranch,
             targetBranch: preview.repo.targetBranch,
@@ -1583,8 +1604,8 @@ export default function planRunnerExtension(pi: ExtensionAPI) {
           });
         }
 
-        if (activeRun) {
-          await writeMergeReceipt(activeRun, {
+        if (mergeRun) {
+          await writeMergeReceipt(mergeRun, {
             strategy: results.some((result) => result.strategy === "atomic") ? "atomic" : "squash",
             repos: results.map((result) => ({
               name: result.name,

@@ -310,6 +310,37 @@ test("resolveRunMergeScope scans direct child repos and asks for confirmation on
   }
 });
 
+test("resolveRunMergeScope ignores stale finished run metadata and falls back to workspace inference", async () => {
+  const { resolveRunMergeScope } = await loadPlanRunnerModule();
+  const workspace = await mkdtemp(join(tmpdir(), "plan-runner-stale-run-"));
+
+  try {
+    const repoA = await createRepo(workspace, "repo-a");
+    const repoB = await createRepo(workspace, "repo-b");
+
+    git(repoA, ["checkout", "-b", "pi/shared-task"]);
+    await commitFile(repoA, "notes.txt", "repo-a change\n", "feat: update repo a");
+
+    git(repoB, ["checkout", "-b", "pi/shared-task"]);
+    await commitFile(repoB, "notes.txt", "repo-b change\n", "feat: update repo b");
+
+    const scope = await resolveRunMergeScope({
+      cwd: workspace,
+      git: gitRunner,
+      activeRunState: "done",
+      activeRun: {
+        branchName: "pi/old-task",
+        repos: [{ name: "old-repo", root: join(workspace, "missing-repo"), previousBranch: "main", dirty: false }],
+      },
+    });
+
+    assert.equal(scope.sourceBranch, "pi/shared-task");
+    assert.deepEqual(scope.repos.map((entry) => entry.name), ["repo-a", "repo-b"]);
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
 test("previewMergeTarget and applyMergeTarget merge a clean task branch without switching the original checkout", async () => {
   const { buildCommitPlan, previewMergeTarget, applyMergeTarget } = await loadPlanRunnerModule();
   const workspace = await mkdtemp(join(tmpdir(), "plan-runner-merge-"));

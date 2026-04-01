@@ -773,16 +773,35 @@ export async function resolveRunMergeScope(input: {
   activeRun?: Pick<RunState, "branchName" | "repos">;
   activeRunState?: string;
 }): Promise<MergeScope> {
-  if (input.activeRun && (input.activeRunState === undefined || ACTIVE_RUN_STATES.has(input.activeRunState))) {
-    const repos = await Promise.all(input.activeRun.repos.map(async (repo) => {
-      const state = await detectRepoState(input.git, { name: repo.name, root: repo.root }, repo.previousBranch);
-      return {
-        ...state,
-        sourceBranch: input.activeRun!.branchName,
-        targetBranch: repo.previousBranch,
-      };
-    }));
-    return { sourceBranch: input.activeRun.branchName, repos, requiresConfirmation: false };
+  if (input.activeRun) {
+    const repos: MergeScopeRepo[] = [];
+    let canUseActiveRun = true;
+
+    for (const repo of input.activeRun.repos) {
+      if (!(await exists(repo.root))) {
+        canUseActiveRun = false;
+        break;
+      }
+      try {
+        const state = await detectRepoState(input.git, { name: repo.name, root: repo.root }, repo.previousBranch);
+        if (state.currentBranch !== input.activeRun.branchName) {
+          canUseActiveRun = false;
+          break;
+        }
+        repos.push({
+          ...state,
+          sourceBranch: input.activeRun.branchName,
+          targetBranch: repo.previousBranch,
+        });
+      } catch {
+        canUseActiveRun = false;
+        break;
+      }
+    }
+
+    if (canUseActiveRun && repos.length === input.activeRun.repos.length) {
+      return { sourceBranch: input.activeRun.branchName, repos, requiresConfirmation: false };
+    }
   }
 
   const repos = await detectWorkspaceRepos(input.cwd, input.git);
@@ -950,6 +969,31 @@ export async function applyMergeTarget(
   }
 }
 
+export async function pushMergedBranches(
+  git: GitRunner,
+  repos: Array<Pick<MergeScopeRepo, "name" | "root" | "sourceBranch" | "targetBranch">>,
+): Promise<Array<Pick<MergeScopeRepo, "name" | "root" | "sourceBranch" | "targetBranch"> & {
+  remoteName: string;
+  refspec: string;
+}>> {
+  const results = [];
+  for (const repo of repos) {
+    const localRef = `refs/heads/${repo.targetBranch}`;
+    const remoteRef = `refs/heads/${repo.targetBranch}`;
+    const refspec = `${localRef}:${remoteRef}`;
+    const pushResult = await git(repo.root, ["push", "origin", refspec]);
+    if (pushResult.code !== 0) {
+      throw new Error(`Failed to push ${repo.name} ${repo.targetBranch} to origin/${repo.targetBranch}: ${pushResult.stderr || pushResult.stdout}`);
+    }
+    results.push({
+      ...repo,
+      remoteName: "origin",
+      refspec,
+    });
+  }
+  return results;
+}
+
 export async function writeMergeReceipt(
   run: Pick<RunState, "runId" | "runDir" | "branchName">,
   result: { strategy: CommitPlan["strategy"]; repos: Array<Record<string, unknown>> },
@@ -1019,6 +1063,70 @@ function buildMergeSummary(results: Array<{ name: string; status: string; target
   return results.map((result) => {
     const commits = result.commitIds.length > 0 ? ` (${result.commitIds.join(", ")})` : "";
     return `- ${result.name}: ${result.status} -> ${result.targetBranch}${commits}`;
+  }).join("\n");
+}
+
+function buildPushSummary(results: Array<{ name: string; targetBranch: string; remoteName: string }>): string {
+  if (results.length === 0) return "- No branch push required";
+  return results.map((result) => `- ${result.name}: pushed ${result.targetBranch} -> ${result.remoteName}/${result.targetBranch}`).join("\n");
+}
+
+export function buildDeleteBranchConfirmationMessage(
+  repos: Array<Pick<MergeScopeRepo, "name" | "root" | "sourceBranch" | "targetBranch">>,
+): string {
+  const sourceBranch = repos[0]?.sourceBranch ?? "task branch";
+  const repoLines = repos.map((repo) => `- ${repo.name}: ${repo.sourceBranch} -> ${repo.targetBranch}`).join("\n");
+  return [
+    `Delete merged task branch \`${sourceBranch}\` from these repos?`,
+    repoLines,
+    "Default: delete. Choose Cancel to keep the branch.",
+  ].join("\n");
+}
+
+export async function finalizeMergedBranches(
+  git: GitRunner,
+  repos: Array<Pick<MergeScopeRepo, "name" | "root" | "sourceBranch" | "targetBranch">>,
+  options: { deleteSourceBranch: boolean },
+): Promise<Array<Pick<MergeScopeRepo, "name" | "root" | "sourceBranch" | "targetBranch"> & {
+  switched: boolean;
+  deleted: boolean;
+  deleteError?: string;
+}>> {
+  const results = repos.map((repo) => ({ ...repo, switched: false, deleted: false as boolean, deleteError: undefined as string | undefined }));
+
+  for (const result of results) {
+    const checkoutResult = await git(result.root, ["checkout", result.targetBranch]);
+    if (checkoutResult.code !== 0) {
+      throw new Error(`Failed to switch ${result.name} to ${result.targetBranch}: ${checkoutResult.stderr || checkoutResult.stdout}`);
+    }
+    result.switched = true;
+  }
+
+  if (!options.deleteSourceBranch) {
+    return results;
+  }
+
+  for (const result of results) {
+    if (result.sourceBranch === result.targetBranch) continue;
+    const deleteResult = await git(result.root, ["branch", "-D", result.sourceBranch]);
+    if (deleteResult.code !== 0) {
+      result.deleteError = deleteResult.stderr || deleteResult.stdout || `Failed to delete ${result.sourceBranch}`;
+      continue;
+    }
+    result.deleted = true;
+  }
+
+  return results;
+}
+
+function buildCleanupSummary(results: Array<{ name: string; targetBranch: string; deleted: boolean; deleteError?: string }>): string {
+  return results.map((result) => {
+    const deleteStatus = result.deleteError
+      ? `delete failed (${result.deleteError.trim()})`
+      : result.deleted
+        ? "branch deleted"
+        : "branch kept";
+    return `- ${result.name}: switched to ${result.targetBranch}; ${deleteStatus}`;
   }).join("\n");
 }
 
@@ -1506,6 +1614,7 @@ export default function planRunnerExtension(pi: ExtensionAPI) {
       let mergeRunState: string | undefined;
 
       if (activeRun) {
+        mergeRun = activeRun;
         const running = await tmuxSessionExists(activeRun.tmuxSession);
         if (running) {
           ctx.ui.notify("The current run is still active. Wait for it to finish before merging.", "warning");
@@ -1604,6 +1713,9 @@ export default function planRunnerExtension(pi: ExtensionAPI) {
           });
         }
 
+        const reposToPush = scope.repos.filter((repo) => results.some((result) => result.name === repo.name && result.status === "merged"));
+        const pushResults = await pushMergedBranches(git, reposToPush);
+
         if (mergeRun) {
           await writeMergeReceipt(mergeRun, {
             strategy: results.some((result) => result.strategy === "atomic") ? "atomic" : "squash",
@@ -1614,14 +1726,25 @@ export default function planRunnerExtension(pi: ExtensionAPI) {
               targetBranch: result.targetBranch,
               status: result.status,
               commitIds: result.commitIds,
+              pushed: pushResults.some((pushResult) => pushResult.name === result.name),
+              pushedRemote: pushResults.find((pushResult) => pushResult.name === result.name)?.remoteName,
             })),
           });
         }
 
+        const deleteSourceBranch = ctx.hasUI
+          ? await ctx.ui.confirm("Delete merged task branch?", buildDeleteBranchConfirmationMessage(scope.repos))
+          : true;
+        const cleanupResults = await finalizeMergedBranches(git, scope.repos, { deleteSourceBranch });
+
         const summary = buildMergeSummary(results);
-        if (ctx.hasUI) {
-          ctx.ui.notify(`Merged ${scope.sourceBranch}\n${summary}`, "success");
-        }
+        const pushSummary = buildPushSummary(pushResults);
+        const cleanupSummary = buildCleanupSummary(cleanupResults);
+        const deleteFailures = cleanupResults.filter((result) => result.deleteError);
+        ctx.ui.notify(
+          `Merged ${scope.sourceBranch}\n${summary}\n${pushSummary}\n${cleanupSummary}`,
+          deleteFailures.length > 0 ? "warning" : "success",
+        );
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         ctx.ui.notify(message, "error");

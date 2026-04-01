@@ -101,6 +101,15 @@ async function createRepo(parentDir, name) {
   return repo;
 }
 
+async function createRepoWithOrigin(parentDir, name) {
+  const repo = await createRepo(parentDir, name);
+  const remote = join(parentDir, `${name}-origin.git`);
+  git(parentDir, ["init", "--bare", remote]);
+  git(repo, ["remote", "add", "origin", remote]);
+  git(repo, ["push", "-u", "origin", "main"]);
+  return { repo, remote };
+}
+
 async function commitFile(repoRoot, fileName, content, message) {
   await writeFile(join(repoRoot, fileName), content, "utf8");
   git(repoRoot, ["add", fileName]);
@@ -246,6 +255,102 @@ test("registers run-merge command", async () => {
   assert.ok(commands.has("run-merge"));
 });
 
+test("run-merge pushes the merged target branch to origin before deleting the source branch", async () => {
+  const { default: planRunnerExtension } = await loadPlanRunnerModule();
+  const workspace = await mkdtemp(join(tmpdir(), "plan-runner-command-push-"));
+
+  try {
+    const { repo, remote } = await createRepoWithOrigin(workspace, "repo-a");
+    git(repo, ["checkout", "-b", "pi/task-command"]);
+    await commitFile(repo, "notes.txt", "command merge\n", "feat: command merge");
+
+    const runDir = await mkdtemp(join(tmpdir(), "plan-runner-command-run-"));
+    const run = {
+      ...createRun(),
+      runDir,
+      summaryFile: join(runDir, "summary.md"),
+      statusFile: join(runDir, "status.json"),
+      stderrLog: join(runDir, "stderr.log"),
+      verifyLog: join(runDir, "verify.log"),
+      fullJson: join(runDir, "result.json"),
+      exitCodeFile: join(runDir, "exit.code"),
+      runScript: join(runDir, "run.zsh"),
+      taskFile: join(runDir, "task.md"),
+      planFile: join(runDir, "plan.md"),
+      branchName: "pi/task-command",
+      repos: [{ name: "repo-a", root: repo, previousBranch: "main", dirty: false }],
+      tmuxSession: "pi-run-command-push",
+    };
+    await writeFile(run.statusFile, `${JSON.stringify({ state: "done", phase: "complete" }, null, 2)}\n`, "utf8");
+    await writeFile(run.exitCodeFile, "0\n", "utf8");
+    await writeFile(run.summaryFile, "# done\n", "utf8");
+
+    const commands = new Map();
+    const handlers = new Map();
+    const notifications = [];
+
+    planRunnerExtension({
+      on(name, handler) {
+        handlers.set(name, handler);
+      },
+      appendEntry() {},
+      async exec(command, args) {
+        if (command === "tmux") {
+          return { code: 1, stdout: "", stderr: "" };
+        }
+        if (command === "git") {
+          const result = spawnSync("git", args, { encoding: "utf8" });
+          return {
+            code: result.status ?? 0,
+            stdout: result.stdout ?? "",
+            stderr: result.stderr ?? "",
+          };
+        }
+        throw new Error(`Unexpected command: ${command}`);
+      },
+      sendMessage() {},
+      sendUserMessage() {},
+      getThinkingLevel() {
+        return "high";
+      },
+      registerCommand(name, command) {
+        commands.set(name, command);
+      },
+    });
+
+    const ctx = {
+      cwd: workspace,
+      hasUI: false,
+      ui: {
+        notify(message, level) {
+          notifications.push({ message, level });
+        },
+        setStatus() {},
+        theme: {
+          fg(_color, label) {
+            return label;
+          },
+        },
+      },
+      sessionManager: {
+        getEntries() {
+          return [{ type: "custom", customType: "plan-runner-state", data: { run } }];
+        },
+      },
+    };
+
+    await handlers.get("session_start")({}, ctx);
+    await commands.get("run-merge").handler("", ctx);
+
+    assert.equal(git(remote, ["rev-parse", "refs/heads/main"]), git(repo, ["rev-parse", "main"]));
+    assert.equal(git(repo, ["rev-parse", "--abbrev-ref", "HEAD"]), "main");
+    assert.equal(git(repo, ["branch", "--list", "pi/task-command"]), "");
+    assert.match(notifications.at(-1)?.message ?? "", /Merged pi\/task-command/);
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
 test("resolveRunMergeScope prefers active run metadata", async () => {
   const { resolveRunMergeScope } = await loadPlanRunnerModule();
   const workspace = await mkdtemp(join(tmpdir(), "plan-runner-scope-"));
@@ -273,6 +378,34 @@ test("resolveRunMergeScope prefers active run metadata", async () => {
     })), [
       { name: "repo-a", sourceBranch: "pi/task-merge", targetBranch: "main" },
     ]);
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("resolveRunMergeScope still uses finished active run metadata when repos remain on the task branch", async () => {
+  const { resolveRunMergeScope } = await loadPlanRunnerModule();
+  const workspace = await mkdtemp(join(tmpdir(), "plan-runner-finished-scope-"));
+
+  try {
+    const repo = await createRepo(workspace, "repo-a");
+    git(repo, ["branch", "release"]);
+    git(repo, ["checkout", "-b", "pi/task-finished"]);
+    await commitFile(repo, "notes.txt", "task change\n", "feat: update task branch");
+
+    const scope = await resolveRunMergeScope({
+      cwd: workspace,
+      git: gitRunner,
+      activeRunState: "done",
+      activeRun: {
+        branchName: "pi/task-finished",
+        repos: [{ name: "repo-a", root: repo, previousBranch: "release", dirty: false }],
+      },
+    });
+
+    assert.equal(scope.sourceBranch, "pi/task-finished");
+    assert.deepEqual(scope.repos.map((entry) => entry.name), ["repo-a"]);
+    assert.deepEqual(scope.repos.map((entry) => entry.targetBranch), ["release"]);
   } finally {
     await rm(workspace, { recursive: true, force: true });
   }
@@ -380,6 +513,53 @@ test("previewMergeTarget and applyMergeTarget merge a clean task branch without 
   }
 });
 
+test("pushMergedBranches pushes the rewritten target branch to origin instead of the pre-merge source branch", async () => {
+  const { buildCommitPlan, previewMergeTarget, applyMergeTarget, pushMergedBranches } = await loadPlanRunnerModule();
+  const workspace = await mkdtemp(join(tmpdir(), "plan-runner-push-"));
+
+  try {
+    const { repo, remote } = await createRepoWithOrigin(workspace, "repo-a");
+    git(repo, ["checkout", "-b", "pi/task-clean"]);
+    await commitFile(repo, "notes.txt", "clean merge\n", "feat: add clean merge");
+
+    const preview = await previewMergeTarget(gitRunner, {
+      name: "repo-a",
+      root: repo,
+      sourceBranch: "pi/task-clean",
+      targetBranch: "main",
+    });
+    const plan = buildCommitPlan({
+      changedFiles: preview.changedFiles,
+      commitSubjects: preview.commitSubjects,
+      fallbackMessage: "feat: add clean merge",
+    });
+    await applyMergeTarget(gitRunner, {
+      name: "repo-a",
+      root: repo,
+      sourceBranch: "pi/task-clean",
+      targetBranch: "main",
+    }, preview, plan);
+
+    const localMain = git(repo, ["rev-parse", "main"]);
+    const sourceHead = git(repo, ["rev-parse", "pi/task-clean"]);
+    assert.notEqual(localMain, sourceHead);
+
+    await pushMergedBranches(gitRunner, [
+      {
+        name: "repo-a",
+        root: repo,
+        sourceBranch: "pi/task-clean",
+        targetBranch: "main",
+      },
+    ]);
+
+    assert.equal(git(remote, ["rev-parse", "refs/heads/main"]), localMain);
+    assert.notEqual(git(remote, ["rev-parse", "refs/heads/main"]), sourceHead);
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
 test("previewMergeTarget reports conflicts without dirtying the original checkout", async () => {
   const { previewMergeTarget } = await loadPlanRunnerModule();
   const workspace = await mkdtemp(join(tmpdir(), "plan-runner-conflict-"));
@@ -440,5 +620,82 @@ test("writeMergeReceipt stores merge results under the run directory", async () 
     assert.equal(receipt.repos[0].commitIds[0], "abc123");
   } finally {
     await rm(runDir, { recursive: true, force: true });
+  }
+});
+
+test("buildDeleteBranchConfirmationMessage lists all repos and default delete behavior", async () => {
+  const { buildDeleteBranchConfirmationMessage } = await loadPlanRunnerModule();
+  const message = buildDeleteBranchConfirmationMessage([
+    { name: "repo-a", root: "/tmp/repo-a", sourceBranch: "pi/task-clean", targetBranch: "main" },
+    { name: "repo-b", root: "/tmp/repo-b", sourceBranch: "pi/task-clean", targetBranch: "master" },
+  ]);
+
+  assert.match(message, /pi\/task-clean/);
+  assert.match(message, /repo-a: pi\/task-clean -> main/);
+  assert.match(message, /repo-b: pi\/task-clean -> master/);
+  assert.match(message, /default: delete/i);
+});
+
+test("finalizeMergedBranches switches repos back to target branches and deletes task branches by default", async () => {
+  const { finalizeMergedBranches } = await loadPlanRunnerModule();
+  const workspace = await mkdtemp(join(tmpdir(), "plan-runner-finalize-delete-"));
+
+  try {
+    const repo = await createRepo(workspace, "repo-a");
+    git(repo, ["checkout", "-b", "pi/task-clean"]);
+    await commitFile(repo, "notes.txt", "clean merge\n", "feat: add clean merge");
+    git(repo, ["checkout", "main"]);
+    git(repo, ["merge", "--ff-only", "pi/task-clean"]);
+    git(repo, ["checkout", "pi/task-clean"]);
+
+    const results = await finalizeMergedBranches(gitRunner, [
+      {
+        name: "repo-a",
+        root: repo,
+        sourceBranch: "pi/task-clean",
+        targetBranch: "main",
+      },
+    ], {
+      deleteSourceBranch: true,
+    });
+
+    assert.equal(results[0].switched, true);
+    assert.equal(results[0].deleted, true);
+    assert.equal(git(repo, ["rev-parse", "--abbrev-ref", "HEAD"]), "main");
+    assert.equal(git(repo, ["branch", "--list", "pi/task-clean"]), "");
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("finalizeMergedBranches can keep task branches while still switching back to target branches", async () => {
+  const { finalizeMergedBranches } = await loadPlanRunnerModule();
+  const workspace = await mkdtemp(join(tmpdir(), "plan-runner-finalize-keep-"));
+
+  try {
+    const repo = await createRepo(workspace, "repo-a");
+    git(repo, ["checkout", "-b", "pi/task-keep"]);
+    await commitFile(repo, "notes.txt", "keep branch\n", "feat: keep task branch");
+    git(repo, ["checkout", "main"]);
+    git(repo, ["merge", "--ff-only", "pi/task-keep"]);
+    git(repo, ["checkout", "pi/task-keep"]);
+
+    const results = await finalizeMergedBranches(gitRunner, [
+      {
+        name: "repo-a",
+        root: repo,
+        sourceBranch: "pi/task-keep",
+        targetBranch: "main",
+      },
+    ], {
+      deleteSourceBranch: false,
+    });
+
+    assert.equal(results[0].switched, true);
+    assert.equal(results[0].deleted, false);
+    assert.equal(git(repo, ["rev-parse", "--abbrev-ref", "HEAD"]), "main");
+    assert.equal(runGitResult(repo, ["show-ref", "--verify", "refs/heads/pi/task-keep"]).code, 0);
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
   }
 });

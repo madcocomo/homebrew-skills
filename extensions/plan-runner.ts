@@ -969,6 +969,86 @@ export async function applyMergeTarget(
   }
 }
 
+export async function syncTargetBranchesWithOrigin(
+  git: GitRunner,
+  repos: Array<Pick<MergeScopeRepo, "name" | "root" | "sourceBranch" | "targetBranch">>,
+): Promise<Array<Pick<MergeScopeRepo, "name" | "root" | "sourceBranch" | "targetBranch"> & {
+  status: "up-to-date" | "fast-forwarded" | "local-ahead" | "merged-origin" | "no-remote";
+}>> {
+  const results = [];
+  for (const repo of repos) {
+    const fetchResult = await git(repo.root, ["fetch", "origin", repo.targetBranch]);
+    if (fetchResult.code !== 0) {
+      throw new Error(`Failed to fetch origin/${repo.targetBranch} for ${repo.name}: ${fetchResult.stderr || fetchResult.stdout}`);
+    }
+
+    const remoteTrackingRef = `refs/remotes/origin/${repo.targetBranch}`;
+    const remoteExists = await git(repo.root, ["show-ref", "--verify", "--quiet", remoteTrackingRef]);
+    if (remoteExists.code !== 0) {
+      results.push({ ...repo, status: "no-remote" as const });
+      continue;
+    }
+
+    const localHead = await readGitOutput(git, repo.root, ["rev-parse", repo.targetBranch], `Cannot resolve ${repo.targetBranch} for ${repo.name}`);
+    const remoteHead = await readGitOutput(git, repo.root, ["rev-parse", remoteTrackingRef], `Cannot resolve origin/${repo.targetBranch} for ${repo.name}`);
+    if (localHead === remoteHead) {
+      results.push({ ...repo, status: "up-to-date" as const });
+      continue;
+    }
+
+    const mergeBase = await readGitOutput(git, repo.root, ["merge-base", repo.targetBranch, remoteTrackingRef], `Cannot compute merge base for ${repo.name}`);
+    if (mergeBase === localHead) {
+      const ffResult = await git(repo.root, ["branch", "-f", repo.targetBranch, remoteTrackingRef]);
+      if (ffResult.code !== 0) {
+        throw new Error(`Failed to fast-forward ${repo.name} ${repo.targetBranch} to origin/${repo.targetBranch}: ${ffResult.stderr || ffResult.stdout}`);
+      }
+      results.push({ ...repo, status: "fast-forwarded" as const });
+      continue;
+    }
+
+    if (mergeBase === remoteHead) {
+      results.push({ ...repo, status: "local-ahead" as const });
+      continue;
+    }
+
+    const previewRepo: MergeScopeRepo = {
+      ...repo,
+      currentBranch: repo.sourceBranch,
+      dirty: false,
+      detached: false,
+    };
+    const { tempDir, tempBranch } = await createPreviewWorktree(git, previewRepo);
+    try {
+      const mergeResult = await git(tempDir, ["merge", "--no-edit", remoteTrackingRef]);
+      if (mergeResult.code !== 0) {
+        const conflictFiles = await mergeConflictFiles(git, tempDir);
+        throw new Error([
+          `${repo.name} target branch ${repo.targetBranch} diverged from origin/${repo.targetBranch}.`,
+          "Resolve trunk sync first, then run /run-merge again.",
+          conflictFiles.length > 0 ? `Files: ${conflictFiles.join(", ")}` : undefined,
+        ].filter((value): value is string => Boolean(value)).join("\n"));
+      }
+      const moveResult = await git(repo.root, ["branch", "-f", repo.targetBranch, tempBranch]);
+      if (moveResult.code !== 0) {
+        throw new Error(`Failed to update ${repo.name} ${repo.targetBranch} after merging origin/${repo.targetBranch}: ${moveResult.stderr || moveResult.stdout}`);
+      }
+      results.push({ ...repo, status: "merged-origin" as const });
+    } finally {
+      await cleanupMergePreview(git, {
+        status: "clean",
+        repo,
+        targetHead: "",
+        mergeBase: "",
+        changedFiles: [],
+        commitSubjects: [],
+        tempDir,
+        tempBranch,
+      });
+    }
+  }
+  return results;
+}
+
 export async function pushMergedBranches(
   git: GitRunner,
   repos: Array<Pick<MergeScopeRepo, "name" | "root" | "sourceBranch" | "targetBranch">>,
@@ -1654,6 +1734,8 @@ export default function planRunnerExtension(pi: ExtensionAPI) {
             return;
           }
         }
+
+        await syncTargetBranchesWithOrigin(git, scope.repos);
 
         const planDetails = await readPlanDetails(mergeRun?.planFile);
         const results: Array<{ name: string; status: string; targetBranch: string; commitIds: string[]; strategy?: CommitPlan["strategy"] }> = [];

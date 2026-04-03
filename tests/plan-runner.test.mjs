@@ -513,6 +513,42 @@ test("previewMergeTarget and applyMergeTarget merge a clean task branch without 
   }
 });
 
+test("syncTargetBranchesWithOrigin fast-forwards a stale local target branch before merge", async () => {
+  const { syncTargetBranchesWithOrigin } = await loadPlanRunnerModule();
+  const workspace = await mkdtemp(join(tmpdir(), "plan-runner-sync-"));
+
+  try {
+    const { repo, remote } = await createRepoWithOrigin(workspace, "repo-a");
+    git(repo, ["checkout", "-b", "pi/task-sync"]);
+
+    const updater = join(workspace, "repo-a-updater");
+    git(workspace, ["clone", remote, updater]);
+    git(updater, ["config", "user.email", "plan-runner@example.com"]);
+    git(updater, ["config", "user.name", "Plan Runner Test"]);
+    await commitFile(updater, "remote.txt", "remote change\n", "fix: advance origin main");
+    git(updater, ["push", "origin", "main"]);
+
+    const localMainBefore = git(repo, ["rev-parse", "main"]);
+    const remoteMain = git(remote, ["rev-parse", "refs/heads/main"]);
+    assert.notEqual(localMainBefore, remoteMain);
+
+    const results = await syncTargetBranchesWithOrigin(gitRunner, [
+      {
+        name: "repo-a",
+        root: repo,
+        sourceBranch: "pi/task-sync",
+        targetBranch: "main",
+      },
+    ]);
+
+    assert.equal(results[0].status, "fast-forwarded");
+    assert.equal(git(repo, ["rev-parse", "main"]), remoteMain);
+    assert.equal(git(repo, ["rev-parse", "--abbrev-ref", "HEAD"]), "pi/task-sync");
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
 test("pushMergedBranches pushes the rewritten target branch to origin instead of the pre-merge source branch", async () => {
   const { buildCommitPlan, previewMergeTarget, applyMergeTarget, pushMergedBranches } = await loadPlanRunnerModule();
   const workspace = await mkdtemp(join(tmpdir(), "plan-runner-push-"));
@@ -520,7 +556,7 @@ test("pushMergedBranches pushes the rewritten target branch to origin instead of
   try {
     const { repo, remote } = await createRepoWithOrigin(workspace, "repo-a");
     git(repo, ["checkout", "-b", "pi/task-clean"]);
-    await commitFile(repo, "notes.txt", "clean merge\n", "feat: add clean merge");
+    await commitFile(repo, "notes.txt", "clean merge\n", "feat: task branch clean merge");
 
     const preview = await previewMergeTarget(gitRunner, {
       name: "repo-a",

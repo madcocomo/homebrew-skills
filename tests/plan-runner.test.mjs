@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
 import { copyFile, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const repoRoot = fileURLToPath(new URL("..", import.meta.url));
@@ -114,6 +114,200 @@ async function commitFile(repoRoot, fileName, content, message) {
   await writeFile(join(repoRoot, fileName), content, "utf8");
   git(repoRoot, ["add", fileName]);
   git(repoRoot, ["commit", "-m", message]);
+}
+
+async function createProjectRoot(parentDir, name = "project") {
+  const projectRoot = join(parentDir, name);
+  await mkdir(join(projectRoot, ".pi", "runs"), { recursive: true });
+  await mkdir(join(projectRoot, "docs", "superpowers", "plans"), { recursive: true });
+  return projectRoot;
+}
+
+function buildStoredRun(projectRoot, overrides = {}) {
+  const runId = overrides.runId ?? "20260426-100000-demo-run";
+  const runDir = join(projectRoot, ".pi", "runs", runId);
+  const planFile = overrides.planFile ?? join(projectRoot, "docs", "superpowers", "plans", `${runId}.md`);
+  return {
+    ...createRun(),
+    ...overrides,
+    runId,
+    planFile,
+    workdir: overrides.workdir ?? projectRoot,
+    runDir,
+    taskFile: join(runDir, "task.md"),
+    summaryFile: join(runDir, "summary.md"),
+    statusFile: join(runDir, "status.json"),
+    stderrLog: join(runDir, "stderr.log"),
+    verifyLog: join(runDir, "verify.log"),
+    fullJson: join(runDir, "result.json"),
+    exitCodeFile: join(runDir, "exit.code"),
+    runScript: join(runDir, "run.zsh"),
+    tmuxSession: overrides.tmuxSession ?? `pi-${runId}`,
+    branchName: overrides.branchName ?? `pi/${runId}`,
+    repos: overrides.repos ?? [{ name: "homebrew-skills", root: projectRoot, previousBranch: "main", dirty: false }],
+    startedAt: overrides.startedAt ?? "2026-04-26T10:00:00.000Z",
+    modelProvider: overrides.modelProvider ?? "anthropic",
+    modelId: overrides.modelId ?? "claude-opus-4-6",
+    thinkingLevel: overrides.thinkingLevel ?? "high",
+    modelDisplay: overrides.modelDisplay ?? "anthropic/claude-opus-4-6:high",
+  };
+}
+
+async function writePersistedRun(projectRoot, overrides = {}) {
+  const run = buildStoredRun(projectRoot, overrides);
+  await mkdir(run.runDir, { recursive: true });
+  await mkdir(dirname(run.planFile), { recursive: true });
+  await writeFile(run.planFile, `# ${run.runId}\n`, "utf8");
+  await writeFile(join(run.runDir, "run.json"), `${JSON.stringify(run, null, 2)}\n`, "utf8");
+  await writeFile(run.summaryFile, overrides.summaryContent ?? `# Summary for ${run.runId}\n`, "utf8");
+  await writeFile(run.statusFile, `${JSON.stringify({
+    state: overrides.state ?? "done",
+    phase: "complete",
+    planFile: run.planFile,
+    tmuxSession: run.tmuxSession,
+    branchName: run.branchName,
+    modelProvider: run.modelProvider,
+    modelId: run.modelId,
+    thinkingLevel: run.thinkingLevel,
+    modelDisplay: run.modelDisplay,
+  }, null, 2)}\n`, "utf8");
+  if (overrides.exitCode !== undefined) {
+    await writeFile(run.exitCodeFile, `${overrides.exitCode}\n`, "utf8");
+  }
+  return run;
+}
+
+async function writeLegacyRun(projectRoot, overrides = {}) {
+  const run = buildStoredRun(projectRoot, overrides);
+  await mkdir(run.runDir, { recursive: true });
+  await mkdir(dirname(run.planFile), { recursive: true });
+  await writeFile(run.planFile, `# ${run.runId}\n`, "utf8");
+  await writeFile(run.statusFile, `${JSON.stringify({
+    state: overrides.state ?? "done",
+    phase: "complete",
+    planFile: run.planFile,
+    tmuxSession: run.tmuxSession,
+    branchName: run.branchName,
+    modelProvider: run.modelProvider,
+    modelId: run.modelId,
+    thinkingLevel: run.thinkingLevel,
+    modelDisplay: run.modelDisplay,
+  }, null, 2)}\n`, "utf8");
+  await writeFile(run.summaryFile, overrides.summaryContent ?? [
+    "# Run Summary",
+    `- Result: ${overrides.state ?? "done"}`,
+    `- Plan: ${run.planFile}`,
+    `- Branch: ${run.branchName}`,
+    "",
+  ].join("\n"), "utf8");
+  await writeFile(join(run.runDir, "README.txt"), [
+    `Run ID: ${run.runId}`,
+    `Plan: ${run.planFile}`,
+    `Tmux session: ${run.tmuxSession}`,
+    `Model: ${run.modelDisplay}`,
+    "",
+  ].join("\n"), "utf8");
+  if (overrides.exitCode !== undefined) {
+    await writeFile(run.exitCodeFile, `${overrides.exitCode}\n`, "utf8");
+  }
+  return run;
+}
+
+function createExtensionHarness({ cwd, hasUI = false, uiSelection, sessionEntries = [], runningSessions = [] }) {
+  const commands = new Map();
+  const handlers = new Map();
+  const notifications = [];
+  const statuses = [];
+  const sentMessages = [];
+  const appendedEntries = [];
+  const selectCalls = [];
+  let entries = [...sessionEntries];
+  const liveSessions = new Set(runningSessions);
+
+  const pi = {
+    on(name, handler) {
+      handlers.set(name, handler);
+    },
+    appendEntry(type, data) {
+      appendedEntries.push({ type, data });
+      entries.push({ type: "custom", customType: type, data });
+    },
+    async exec(command, args) {
+      if (command === "tmux") {
+        if (args[0] === "has-session") {
+          return { code: liveSessions.has(args.at(-1)) ? 0 : 1, stdout: "", stderr: "" };
+        }
+        return { code: 0, stdout: "", stderr: "" };
+      }
+      if (command === "git") {
+        const result = spawnSync("git", args, { encoding: "utf8" });
+        return {
+          code: result.status ?? 0,
+          stdout: result.stdout ?? "",
+          stderr: result.stderr ?? "",
+        };
+      }
+      throw new Error(`Unexpected command: ${command}`);
+    },
+    sendMessage(payload) {
+      sentMessages.push(payload);
+    },
+    sendUserMessage(payload) {
+      sentMessages.push({ user: true, payload });
+    },
+    getThinkingLevel() {
+      return "high";
+    },
+    registerCommand(name, command) {
+      commands.set(name, command);
+    },
+  };
+
+  const ctx = {
+    cwd,
+    hasUI,
+    model: { provider: "anthropic", id: "claude-opus-4-6" },
+    ui: {
+      notify(message, level) {
+        notifications.push({ message, level });
+      },
+      setStatus(id, value) {
+        statuses.push({ id, value });
+      },
+      async select(message, choices) {
+        selectCalls.push({ message, choices });
+        return typeof uiSelection === "function" ? uiSelection(message, choices) : uiSelection;
+      },
+      async confirm() {
+        return true;
+      },
+      theme: {
+        fg(_color, label) {
+          return label;
+        },
+      },
+    },
+    sessionManager: {
+      getEntries() {
+        return entries;
+      },
+    },
+  };
+
+  return {
+    pi,
+    ctx,
+    commands,
+    handlers,
+    notifications,
+    statuses,
+    sentMessages,
+    appendedEntries,
+    selectCalls,
+    getEntries() {
+      return entries;
+    },
+  };
 }
 
 test("formatRunModelDisplay returns provider/id:thinking", async () => {
@@ -474,6 +668,33 @@ test("resolveRunMergeScope ignores stale finished run metadata and falls back to
   }
 });
 
+test("resolveRunMergeScope falls back to workspace inference when attached run has no repos", async () => {
+  const { resolveRunMergeScope } = await loadPlanRunnerModule();
+  const workspace = await mkdtemp(join(tmpdir(), "plan-runner-empty-attached-run-"));
+
+  try {
+    const repo = await createRepo(workspace, "repo-a");
+    git(repo, ["checkout", "-b", "pi/attached-task"]);
+    await commitFile(repo, "notes.txt", "attached change\n", "feat: update attached repo");
+
+    const scope = await resolveRunMergeScope({
+      cwd: repo,
+      git: gitRunner,
+      activeRunState: "done",
+      activeRun: {
+        branchName: "pi/attached-task",
+        repos: [],
+      },
+    });
+
+    assert.equal(scope.sourceBranch, "pi/attached-task");
+    assert.deepEqual(scope.repos.map((entry) => entry.name), ["repo-a"]);
+    assert.deepEqual(scope.repos.map((entry) => entry.targetBranch), ["main"]);
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
 test("previewMergeTarget and applyMergeTarget merge a clean task branch without switching the original checkout", async () => {
   const { buildCommitPlan, previewMergeTarget, applyMergeTarget } = await loadPlanRunnerModule();
   const workspace = await mkdtemp(join(tmpdir(), "plan-runner-merge-"));
@@ -731,6 +952,190 @@ test("finalizeMergedBranches can keep task branches while still switching back t
     assert.equal(results[0].deleted, false);
     assert.equal(git(repo, ["rev-parse", "--abbrev-ref", "HEAD"]), "main");
     assert.equal(runGitResult(repo, ["show-ref", "--verify", "refs/heads/pi/task-keep"]).code, 0);
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("findAttachableRuns only reads current project runs and prefers persisted run metadata", async () => {
+  const { findAttachableRuns } = await loadPlanRunnerModule();
+  const workspace = await mkdtemp(join(tmpdir(), "plan-runner-attach-discover-"));
+
+  try {
+    const projectA = await createProjectRoot(workspace, "project-a");
+    const projectB = await createProjectRoot(workspace, "project-b");
+    const attachedRun = await writePersistedRun(projectA, {
+      runId: "20260426-101500-alpha",
+      state: "running",
+      summaryContent: "# Summary for alpha\n",
+    });
+    await writePersistedRun(projectB, {
+      runId: "20260426-111500-beta",
+      summaryContent: "# Summary for beta\n",
+    });
+
+    const candidates = await findAttachableRuns(projectA);
+
+    assert.equal(candidates.length, 1);
+    assert.equal(candidates[0].run.runId, attachedRun.runId);
+    assert.equal(candidates[0].state, "running");
+    assert.match(candidates[0].label, /20260426-101500-alpha/);
+    assert.match(candidates[0].label, /docs\/superpowers\/plans/);
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("findAttachableRuns falls back to legacy artifacts and skips malformed run directories", async () => {
+  const { findAttachableRuns } = await loadPlanRunnerModule();
+  const workspace = await mkdtemp(join(tmpdir(), "plan-runner-attach-legacy-"));
+
+  try {
+    const projectRoot = await createProjectRoot(workspace);
+    const legacyRun = await writeLegacyRun(projectRoot, {
+      runId: "20260426-121500-legacy",
+      branchName: "pi/legacy-branch",
+    });
+    const brokenDir = join(projectRoot, ".pi", "runs", "broken-run");
+    await mkdir(brokenDir, { recursive: true });
+    await writeFile(join(brokenDir, "status.json"), "{not-json}\n", "utf8");
+
+    const candidates = await findAttachableRuns(projectRoot);
+
+    assert.equal(candidates.length, 1);
+    assert.equal(candidates[0].run.runId, legacyRun.runId);
+    assert.equal(candidates[0].run.planFile, legacyRun.planFile);
+    assert.equal(candidates[0].run.branchName, "pi/legacy-branch");
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("resolveAttachRunQuery matches runId and reports ambiguity for duplicate plan names", async () => {
+  const { findAttachableRuns, resolveAttachRunQuery } = await loadPlanRunnerModule();
+  const workspace = await mkdtemp(join(tmpdir(), "plan-runner-attach-query-"));
+
+  try {
+    const projectRoot = await createProjectRoot(workspace);
+    const firstRun = await writePersistedRun(projectRoot, {
+      runId: "20260426-131500-shared-a",
+      planFile: join(projectRoot, "docs", "superpowers", "plans", "shared-plan.md"),
+      startedAt: "2026-04-26T13:15:00.000Z",
+    });
+    await writePersistedRun(projectRoot, {
+      runId: "20260426-141500-shared-b",
+      planFile: join(projectRoot, "docs", "superpowers", "plans", "nested", "shared-plan.md"),
+      startedAt: "2026-04-26T14:15:00.000Z",
+    });
+    const candidates = await findAttachableRuns(projectRoot);
+
+    const uniqueMatch = await resolveAttachRunQuery(firstRun.runId, candidates, {
+      cwd: projectRoot,
+      hasUI: false,
+      ui: { select: async () => undefined },
+    });
+    assert.equal(uniqueMatch.run.runId, firstRun.runId);
+
+    await assert.rejects(
+      () => resolveAttachRunQuery("shared-plan", candidates, {
+        cwd: projectRoot,
+        hasUI: false,
+        ui: { select: async () => undefined },
+      }),
+      /Multiple runs matched input: shared-plan/,
+    );
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("registers run-attach command", async () => {
+  const { default: planRunnerExtension } = await loadPlanRunnerModule();
+  const harness = createExtensionHarness({ cwd: repoRoot });
+
+  planRunnerExtension(harness.pi);
+
+  assert.ok(harness.commands.has("run-attach"));
+});
+
+test("run-attach lists current project runs in no-ui mode when no args are provided", async () => {
+  const { default: planRunnerExtension } = await loadPlanRunnerModule();
+  const workspace = await mkdtemp(join(tmpdir(), "plan-runner-attach-list-"));
+
+  try {
+    const projectRoot = await createProjectRoot(workspace);
+    const storedRun = await writePersistedRun(projectRoot, {
+      runId: "20260426-151500-listing",
+    });
+    const harness = createExtensionHarness({ cwd: projectRoot, hasUI: false });
+
+    planRunnerExtension(harness.pi);
+    await harness.handlers.get("session_start")({}, harness.ctx);
+    await harness.commands.get("run-attach").handler("", harness.ctx);
+
+    assert.match(harness.notifications.at(-1)?.message ?? "", /Attachable runs in the current project/);
+    assert.match(harness.notifications.at(-1)?.message ?? "", new RegExp(storedRun.runId));
+    assert.equal(harness.appendedEntries.length, 0);
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("run-attach can bind a run by query and run-summary uses the attached run", async () => {
+  const { default: planRunnerExtension } = await loadPlanRunnerModule();
+  const workspace = await mkdtemp(join(tmpdir(), "plan-runner-attach-bind-"));
+
+  try {
+    const projectRoot = await createProjectRoot(workspace);
+    const storedRun = await writePersistedRun(projectRoot, {
+      runId: "20260426-161500-bind",
+      summaryContent: "# Attached summary\n- Notes: bound from run-attach\n",
+    });
+    const harness = createExtensionHarness({ cwd: projectRoot, hasUI: false });
+
+    planRunnerExtension(harness.pi);
+    await harness.handlers.get("session_start")({}, harness.ctx);
+    await harness.commands.get("run-attach").handler(storedRun.runId, harness.ctx);
+
+    assert.equal(harness.appendedEntries.at(-1)?.data.run.runId, storedRun.runId);
+    assert.match(harness.notifications.at(-1)?.message ?? "", /Attached to run/);
+
+    await harness.commands.get("run-summary").handler("", harness.ctx);
+    assert.match(harness.sentMessages.at(-1)?.content ?? "", /Attached summary/);
+    assert.match(harness.sentMessages.at(-1)?.content ?? "", new RegExp(storedRun.runId));
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("run-attach with ui can select a run instance when no args are provided", async () => {
+  const { default: planRunnerExtension } = await loadPlanRunnerModule();
+  const workspace = await mkdtemp(join(tmpdir(), "plan-runner-attach-select-"));
+
+  try {
+    const projectRoot = await createProjectRoot(workspace);
+    await writePersistedRun(projectRoot, {
+      runId: "20260426-171500-first",
+      startedAt: "2026-04-26T17:15:00.000Z",
+    });
+    const selectedRun = await writePersistedRun(projectRoot, {
+      runId: "20260426-181500-second",
+      startedAt: "2026-04-26T18:15:00.000Z",
+    });
+    const harness = createExtensionHarness({
+      cwd: projectRoot,
+      hasUI: true,
+      uiSelection(_message, choices) {
+        return choices.find((choice) => choice.includes(selectedRun.runId));
+      },
+    });
+
+    planRunnerExtension(harness.pi);
+    await harness.handlers.get("session_start")({}, harness.ctx);
+    await harness.commands.get("run-attach").handler("", harness.ctx);
+
+    assert.equal(harness.selectCalls.length, 1);
+    assert.equal(harness.appendedEntries.at(-1)?.data.run.runId, selectedRun.runId);
   } finally {
     await rm(workspace, { recursive: true, force: true });
   }

@@ -5,6 +5,7 @@
  * - /run-plan <plan-file>
  * - /run-status
  * - /run-summary
+ * - /run-attach
  * - /run-promote-docs
  * - /run-stop
  * - /run-merge
@@ -156,6 +157,32 @@ export type ParsedRunPlanArgs = {
   displayPath: string;
 };
 
+type RunResolutionMode = "run-id" | "absolute-plan" | "project-relative" | "suffix" | "basename" | "basename-no-ext";
+
+type RunScore = {
+  score: number;
+  mode: RunResolutionMode;
+};
+
+export type AttachableRun = {
+  run: RunState;
+  state: string;
+  startedAtDisplay: string;
+  planDisplayPath: string;
+  label: string;
+  sortKey: string;
+  normalizedPlanPath: string;
+  normalizedPlanPathWithoutExt: string;
+  basename: string;
+  basenameWithoutExt: string;
+};
+
+type RunResolution = {
+  run: RunState;
+  mode: RunResolutionMode;
+  label: string;
+};
+
 class PlanResolutionError extends Error {
   constructor(
     readonly kind: "not-found" | "ambiguous" | "cancelled",
@@ -166,10 +193,21 @@ class PlanResolutionError extends Error {
   }
 }
 
+class RunResolutionError extends Error {
+  constructor(
+    readonly kind: "not-found" | "ambiguous" | "cancelled",
+    message: string,
+  ) {
+    super(message);
+    this.name = "RunResolutionError";
+  }
+}
+
 const STATE_ENTRY = "plan-runner-state";
 const STATUS_ID = "plan-runner";
 const POLL_MS = 3000;
 const ACTIVE_RUN_STATES = new Set(["preparing", "running", "verifying"]);
+const RUN_METADATA_FILE = "run.json";
 
 export function normalizePathArg(raw: string): string {
   return raw.trim().replace(/^@/, "");
@@ -291,6 +329,15 @@ export function buildRunScript(
     "exit \"$code\"",
     "",
   ].join("\n");
+}
+
+async function readJsonFile<T>(path: string): Promise<T | undefined> {
+  try {
+    const content = await readFile(path, "utf8");
+    return JSON.parse(content) as T;
+  } catch {
+    return undefined;
+  }
 }
 
 async function exists(path: string): Promise<boolean> {
@@ -534,6 +581,260 @@ function splitLines(value: string): string[] {
   return value.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
 }
 
+function runMetadataPath(runDir: string): string {
+  return join(runDir, RUN_METADATA_FILE);
+}
+
+function parseModelDisplay(modelDisplay?: string): Partial<RunModelSnapshot> {
+  if (!modelDisplay) return {};
+  const [providerAndId, thinkingLevel] = modelDisplay.split(":");
+  const slashIndex = providerAndId.indexOf("/");
+  if (slashIndex === -1) {
+    return { modelDisplay, thinkingLevel: thinkingLevel ?? "" };
+  }
+  return {
+    modelDisplay,
+    modelProvider: providerAndId.slice(0, slashIndex),
+    modelId: providerAndId.slice(slashIndex + 1),
+    thinkingLevel: thinkingLevel ?? "",
+  };
+}
+
+function extractPrefixedValue(content: string | undefined, prefixes: string[]): string | undefined {
+  if (!content) return undefined;
+  for (const line of splitLines(content)) {
+    for (const prefix of prefixes) {
+      if (line.startsWith(prefix)) {
+        const value = line.slice(prefix.length).trim();
+        if (value) return value;
+      }
+    }
+  }
+  return undefined;
+}
+
+function inferStartedAtFromRunId(runId: string): string | undefined {
+  const match = runId.match(/^(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})/);
+  if (!match) return undefined;
+  return `${match[1]}-${match[2]}-${match[3]}T${match[4]}:${match[5]}:${match[6]}.000Z`;
+}
+
+function displayPlanPath(projectRoot: string, planFile: string): string {
+  const relativePath = relative(projectRoot, planFile).replace(/\\/g, "/");
+  return relativePath.startsWith("..") ? planFile : relativePath;
+}
+
+function buildRunCandidate(run: RunState, projectRoot: string, state: string): AttachableRun {
+  const planDisplayPath = displayPlanPath(projectRoot, run.planFile);
+  const startedAtDisplay = run.startedAt || inferStartedAtFromRunId(run.runId) || run.runId;
+  const normalizedPlanPath = normalizeForMatch(planDisplayPath);
+  const basenameValue = basename(planDisplayPath);
+  const label = [run.runId, state, startedAtDisplay, planDisplayPath, run.branchName || "no-branch"]
+    .filter(Boolean)
+    .join(" · ");
+  return {
+    run,
+    state,
+    startedAtDisplay,
+    planDisplayPath,
+    label,
+    sortKey: startedAtDisplay,
+    normalizedPlanPath,
+    normalizedPlanPathWithoutExt: stripMarkdownExtension(normalizedPlanPath),
+    basename: basenameValue,
+    basenameWithoutExt: basenameValue.replace(/\.[^.]+$/, ""),
+  };
+}
+
+async function deriveStoredRunState(run: Pick<RunState, "statusFile" | "exitCodeFile">): Promise<string> {
+  const status = await readJsonFile<StatusData>(run.statusFile);
+  if (status?.state) return status.state;
+  if (!(await exists(run.exitCodeFile))) return "unknown";
+  const exitCode = (await readFile(run.exitCodeFile, "utf8")).trim();
+  if (!exitCode) return "unknown";
+  return exitCode === "0" ? "done" : "failed";
+}
+
+export async function loadRunStateFromDir(runDir: string): Promise<RunState | undefined> {
+  const persisted = await readJsonFile<RunState>(runMetadataPath(runDir));
+  if (persisted?.runId && persisted.planFile) {
+    return persisted;
+  }
+
+  const statusPath = join(runDir, "status.json");
+  const summaryPath = join(runDir, "summary.md");
+  const readmePath = join(runDir, "README.txt");
+  const status = await readJsonFile<StatusData>(statusPath);
+  const summary = (await exists(summaryPath)) ? await readFile(summaryPath, "utf8") : undefined;
+  const readme = (await exists(readmePath)) ? await readFile(readmePath, "utf8") : undefined;
+  if (!status && !summary && !readme) return undefined;
+
+  const runId = basename(runDir);
+  const projectRoot = dirname(dirname(dirname(runDir)));
+  const modelDisplay = status?.modelDisplay
+    ?? extractPrefixedValue(summary, ["- Model:"])
+    ?? extractPrefixedValue(readme, ["Model:"]);
+  const parsedModel = parseModelDisplay(modelDisplay);
+  const planFile = status?.planFile
+    ?? extractPrefixedValue(summary, ["- Plan:"])
+    ?? extractPrefixedValue(readme, ["Plan:"]);
+  if (!planFile) return undefined;
+
+  return {
+    runId,
+    planFile,
+    extraInstructions: extractPrefixedValue(readme, ["Extra instructions:"]),
+    workdir: projectRoot,
+    runDir,
+    taskFile: join(runDir, "task.md"),
+    summaryFile: summaryPath,
+    statusFile: statusPath,
+    stderrLog: join(runDir, "stderr.log"),
+    verifyLog: join(runDir, "verify.log"),
+    fullJson: join(runDir, "result.json"),
+    exitCodeFile: join(runDir, "exit.code"),
+    runScript: join(runDir, "run.zsh"),
+    tmuxSession: status?.tmuxSession ?? extractPrefixedValue(readme, ["Tmux session:"]) ?? "",
+    branchName: status?.branchName ?? extractPrefixedValue(summary, ["- Branch:"]) ?? "",
+    repos: [],
+    startedAt: inferStartedAtFromRunId(runId) ?? new Date(0).toISOString(),
+    modelProvider: status?.modelProvider ?? parsedModel.modelProvider ?? "",
+    modelId: status?.modelId ?? parsedModel.modelId ?? "",
+    thinkingLevel: status?.thinkingLevel ?? parsedModel.thinkingLevel ?? "",
+    modelDisplay: modelDisplay ?? "",
+    lastKnownState: status?.state,
+    notifiedTerminalState: status?.state ? ["done", "blocked", "failed", "stopped"].includes(status.state) : undefined,
+  };
+}
+
+export async function findAttachableRuns(projectRoot: string): Promise<AttachableRun[]> {
+  const runsRoot = join(projectRoot, ".pi", "runs");
+  if (!(await exists(runsRoot))) return [];
+
+  const entries = await readdir(runsRoot, { withFileTypes: true });
+  const candidates: AttachableRun[] = [];
+  for (const entry of entries.sort((left, right) => right.name.localeCompare(left.name))) {
+    if (!entry.isDirectory()) continue;
+    const run = await loadRunStateFromDir(join(runsRoot, entry.name));
+    if (!run) continue;
+    candidates.push(buildRunCandidate(run, projectRoot, await deriveStoredRunState(run)));
+  }
+
+  return candidates.sort((left, right) => right.sortKey.localeCompare(left.sortKey) || right.run.runId.localeCompare(left.run.runId));
+}
+
+function scoreAttachableRun(input: string, candidate: AttachableRun): RunScore | undefined {
+  const rawInput = normalizePathArg(input);
+  if (!rawInput) return undefined;
+  if (rawInput === candidate.run.runId) {
+    return { score: 700, mode: "run-id" };
+  }
+  if (rawInput === candidate.run.planFile) {
+    return { score: 650, mode: "absolute-plan" };
+  }
+
+  const normalizedInput = normalizeForMatch(rawInput);
+  if (!normalizedInput) return undefined;
+  const normalizedInputWithoutExt = stripMarkdownExtension(normalizedInput);
+
+  if (normalizedInput === candidate.normalizedPlanPath) {
+    return { score: 600, mode: "project-relative" };
+  }
+  if (candidate.normalizedPlanPath.endsWith(`/${normalizedInput}`)) {
+    return { score: 500, mode: "suffix" };
+  }
+  if (candidate.basename.toLowerCase() === normalizedInput) {
+    return { score: 400, mode: "basename" };
+  }
+  if (!normalizedInput.includes("/") && candidate.basenameWithoutExt.toLowerCase() === normalizedInputWithoutExt) {
+    return { score: 300, mode: "basename-no-ext" };
+  }
+
+  return undefined;
+}
+
+async function chooseAttachableRun(
+  input: string,
+  matches: Array<{ candidate: AttachableRun; score: RunScore }>,
+  ctx: PlanCommandContext,
+): Promise<RunResolution> {
+  const bestScore = Math.max(...matches.map((match) => match.score.score));
+  const bestMatches = matches.filter((match) => match.score.score === bestScore);
+  if (bestMatches.length === 1) {
+    const selected = bestMatches[0];
+    return {
+      run: selected.candidate.run,
+      mode: selected.score.mode,
+      label: selected.candidate.label,
+    };
+  }
+
+  const choices = bestMatches.map((match) => match.candidate.label);
+  if (ctx.hasUI) {
+    const selection = await ctx.ui.select(`Multiple runs matched input: ${input}`, choices);
+    if (selection) {
+      const selected = bestMatches.find((match) => match.candidate.label === selection);
+      if (selected) {
+        return {
+          run: selected.candidate.run,
+          mode: selected.score.mode,
+          label: selected.candidate.label,
+        };
+      }
+    }
+    throw new RunResolutionError("cancelled", `Run selection cancelled for input: ${input}`);
+  }
+
+  throw new RunResolutionError(
+    "ambiguous",
+    [
+      `Multiple runs matched input: ${input}`,
+      ...choices.map((choice) => `- ${choice}`),
+      "Use /run-attach with no args to list current-project runs or pass a more specific run id.",
+    ].join("\n"),
+  );
+}
+
+export async function resolveAttachRunQuery(
+  input: string,
+  candidates: AttachableRun[],
+  ctx: PlanCommandContext,
+): Promise<RunResolution> {
+  const normalizedInput = normalizePathArg(input);
+  if (!normalizedInput) {
+    throw new RunResolutionError("not-found", "Usage: /run-attach [run-id|plan-name]");
+  }
+
+  const matches = candidates
+    .map((candidate) => {
+      const score = scoreAttachableRun(normalizedInput, candidate);
+      return score ? { candidate, score } : undefined;
+    })
+    .filter((value): value is { candidate: AttachableRun; score: RunScore } => Boolean(value));
+
+  if (matches.length === 0) {
+    throw new RunResolutionError(
+      "not-found",
+      `No run matched input: ${normalizedInput}\nUse /run-attach with no args to list attachable runs in the current project.`,
+    );
+  }
+
+  return chooseAttachableRun(normalizedInput, matches, ctx);
+}
+
+function buildAttachableRunsMessage(candidates: AttachableRun[]): string {
+  return [
+    "Attachable runs in the current project:",
+    ...candidates.map((candidate) => `- ${candidate.label}`),
+    "",
+    "Use /run-attach <run-id|plan-name> to bind one directly.",
+  ].join("\n");
+}
+
+async function writeRunMetadata(run: RunState): Promise<void> {
+  await writeFile(runMetadataPath(run.runDir), `${JSON.stringify(run, null, 2)}\n`, "utf8");
+}
+
 function firstPathSegment(path: string): string {
   const normalized = path.replace(/^\.\//, "").replace(/^\//, "");
   const [segment] = normalized.split("/");
@@ -773,7 +1074,7 @@ export async function resolveRunMergeScope(input: {
   activeRun?: Pick<RunState, "branchName" | "repos">;
   activeRunState?: string;
 }): Promise<MergeScope> {
-  if (input.activeRun) {
+  if (input.activeRun && input.activeRun.repos.length > 0) {
     const repos: MergeScopeRepo[] = [];
     let canUseActiveRun = true;
 
@@ -1232,12 +1533,7 @@ export default function planRunnerExtension(pi: ExtensionAPI) {
   }
 
   async function readJson<T>(path: string): Promise<T | undefined> {
-    try {
-      const content = await readFile(path, "utf8");
-      return JSON.parse(content) as T;
-    } catch {
-      return undefined;
-    }
+    return readJsonFile<T>(path);
   }
 
   async function git(repoRoot: string, args: string[]) {
@@ -1414,6 +1710,23 @@ export default function planRunnerExtension(pi: ExtensionAPI) {
 
     await writeFile(run.statusFile, `${JSON.stringify(initialStatus, null, 2)}\n`, "utf8");
     await writeFile(run.summaryFile, initialSummary, "utf8");
+  }
+
+  async function attachRun(run: RunState, ctx: ExtensionContext): Promise<void> {
+    if (activeRun?.runId === run.runId) {
+      await refreshStatus(ctx);
+      ctx.ui.notify(`Already attached to run ${run.runId}`, "info");
+      return;
+    }
+
+    activeRun = run;
+    const { status, derivedState } = await currentStatus();
+    const label = formatRunStatusLabel(derivedState, status?.phase ?? status?.currentGate, run.modelDisplay ?? status?.modelDisplay);
+    activeRun.notifiedTerminalState = ["done", "blocked", "failed", "stopped"].includes(derivedState);
+    persistState();
+    await refreshStatus(ctx);
+    startPoller();
+    ctx.ui.notify(`Attached to run ${run.runId}\nState: ${label}\nPlan: ${displayPlanPath(await findProjectRoot(ctx.cwd), run.planFile)}`, "success");
   }
 
   function buildTaskPrompt(run: RunState, repos: RepoBranch[]): string {
@@ -1645,6 +1958,7 @@ export default function planRunnerExtension(pi: ExtensionAPI) {
         `Logs: ${run.stderrLog}, ${run.verifyLog}, ${run.fullJson}`,
         "",
       ].join("\n"), "utf8");
+      await writeRunMetadata(run);
 
       await launchRun(run);
 
@@ -1658,6 +1972,53 @@ export default function planRunnerExtension(pi: ExtensionAPI) {
           ? repoBranches.map((repo) => `${repo.name} -> ${branchName}`).join(", ")
           : "no repo detected";
         ctx.ui.notify(`Started run ${run.runId}\nModel: ${run.modelDisplay}\nTmux: ${run.tmuxSession}\nBranches: ${repoNote}`, "success");
+      }
+    },
+  });
+
+  pi.registerCommand("run-attach", {
+    description: "Attach the current session to an existing run from the current project",
+    handler: async (args, ctx) => {
+      const projectRoot = await findProjectRoot(ctx.cwd);
+      const candidates = await findAttachableRuns(projectRoot);
+      if (candidates.length === 0) {
+        ctx.ui.notify("No attachable runs found in the current project.", "info");
+        return;
+      }
+
+      if (!normalizePathArg(args)) {
+        if (!ctx.hasUI) {
+          ctx.ui.notify(buildAttachableRunsMessage(candidates), "info");
+          return;
+        }
+
+        const selection = await ctx.ui.select("Select a run to attach", candidates.map((candidate) => candidate.label));
+        if (!selection) {
+          ctx.ui.notify("Run attach cancelled.", "info");
+          return;
+        }
+        const selected = candidates.find((candidate) => candidate.label === selection);
+        if (!selected) {
+          ctx.ui.notify("Selected run could not be resolved.", "error");
+          return;
+        }
+        await attachRun(selected.run, ctx);
+        return;
+      }
+
+      try {
+        const resolved = await resolveAttachRunQuery(args, candidates, ctx);
+        await attachRun(resolved.run, ctx);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        const level = error instanceof RunResolutionError && error.kind === "cancelled"
+          ? "info"
+          : error instanceof RunResolutionError && error.kind === "ambiguous"
+            ? "warning"
+            : message.startsWith("Usage:")
+              ? "warning"
+              : "error";
+        ctx.ui.notify(message, level);
       }
     },
   });

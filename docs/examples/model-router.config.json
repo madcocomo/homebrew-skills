@@ -1,0 +1,41 @@
+{
+  "version": 1,
+  "mode": "off",
+  "models": {
+    "classifier": {
+      "provider": "opencode",
+      "id": "deepseek-v4-flash-free",
+      "supportsImages": false
+    },
+    "weak": {
+      "provider": "opencode",
+      "id": "mimo-v2.5-free",
+      "supportsImages": true
+    },
+    "strong": {
+      "provider": "anthropic",
+      "id": "claude-opus-4-6",
+      "supportsImages": true
+    }
+  },
+  "classification": {
+    "ruleProfile": "conservative-v1",
+    "minWeakConfidence": 0.9,
+    "timeoutMs": 20000,
+    "maxInputChars": 12000
+  },
+  "limits": {
+    "maxWeakContinuationTurns": 4,
+    "maxNoProgressTurns": 2,
+    "maxRepeatedOperationCount": 2
+  },
+  "logging": {
+    "directory": "~/.pi/agent/model-router-logs",
+    "maxReasonChars": 240
+  },
+  "subPi": {
+    "enabled": false,
+    "maxConcurrent": 1,
+    "timeoutMs": 1800000
+  }
+}

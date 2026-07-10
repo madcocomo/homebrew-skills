@@ -1,10 +1,11 @@
 /**
- * Model router extension (phases 1-3 of the multi-model routing design).
+ * Model router extension — downgrade routing for cost reduction.
  *
  * - Default mode is off; a missing config file keeps the extension inert.
- * - All model identities are fixed by configuration; no candidate discovery.
- * - Shadow mode never calls pi.setModel(); active mode only switches to the
- *   configured weak/strong models.
+ * - Classifier + weak model identities are fixed by configuration; no candidate discovery.
+ * - Shadow mode never calls pi.setModel(); active mode only downgrades to
+ *   the configured weak model when the classifier deems the task simple enough.
+ * - "Strong verdict" means do not intervene — let the user's current model continue.
  *
  * See docs/pi-model-routing-design.md for the full design.
  */
@@ -150,7 +151,6 @@ export interface ResolvedRouterConfig {
   models?: {
     classifier: ModelIdentityConfig;
     weak: ModelIdentityConfig;
-    strong: ModelIdentityConfig;
   };
   classification: {
     ruleProfile: "conservative-v1";
@@ -310,18 +310,18 @@ export function parseModelRouterConfig(
 
   let models: ResolvedRouterConfig["models"];
   if (record.models !== undefined) {
-    if (checkExactKeys(record.models, "config.models", ["classifier", "weak", "strong"], errors)) {
+    if (checkExactKeys(record.models, "config.models", ["classifier", "weak"], errors)) {
       const modelsRecord = record.models as Record<string, unknown>;
       const roles: Record<string, ModelIdentityConfig | undefined> = {};
-      for (const role of ["classifier", "weak", "strong"]) {
+      for (const role of ["classifier", "weak"]) {
         if (modelsRecord[role] === undefined) {
           errors.push(`config.models.${role}: required`);
         } else {
           roles[role] = parseModelIdentity(modelsRecord[role], `config.models.${role}`, errors);
         }
       }
-      if (roles.classifier && roles.weak && roles.strong) {
-        models = { classifier: roles.classifier, weak: roles.weak, strong: roles.strong };
+      if (roles.classifier && roles.weak) {
+        models = { classifier: roles.classifier, weak: roles.weak };
       }
     }
   }
@@ -691,10 +691,8 @@ export interface AdmissionInput {
   prompt: string;
   imageCount: number;
   weakSupportsImages: boolean;
-  strongSupportsImages: boolean;
   maxInputChars: number;
   capsule: CapsuleResult;
-  strongSticky: boolean;
 }
 
 export interface Admission {
@@ -740,17 +738,12 @@ export function evaluateAdmission(input: AdmissionInput): Admission {
 
   const hasImages = input.imageCount > 0;
   if (hasImages) {
-    if (!input.weakSupportsImages && !input.strongSupportsImages) {
-      reject.add("no_configured_image_model");
-    } else if (input.weakSupportsImages && !input.strongSupportsImages) {
-      reject.add("image_fallback_unsafe");
-    } else if (!input.weakSupportsImages && input.strongSupportsImages) {
-      strong.add("image_requires_strong");
+    if (!input.weakSupportsImages) {
+      strong.add("image_not_supported_by_weak");
     }
   }
 
   if (input.prompt.length > input.maxInputChars) strong.add("classifier_input_too_large");
-  if (input.strongSticky) strong.add("strong_sticky");
 
   const capsule = input.capsule;
   if (capsule.status === "invalid_scope") {
@@ -975,11 +968,9 @@ export interface RoleReadiness {
 }
 
 export interface ModelsReadiness {
-  roles: { classifier: RoleReadiness; weak: RoleReadiness; strong: RoleReadiness };
-  /** True when active mode may be enabled (strong resolvable + auth ok + image declaration consistent). */
+  roles: { classifier: RoleReadiness; weak: RoleReadiness };
+  /** True when active mode may be enabled (classifier and weak resolvable + auth ok). */
   activeReady: boolean;
-  /** True when classifier or weak are unavailable and active would run all-strong. */
-  degraded: boolean;
   reasons: string[];
 }
 
@@ -1481,10 +1472,8 @@ export function registerSubPiTool(
         prompt: promptForAdmission,
         imageCount: 0,
         weakSupportsImages: config.models?.weak?.supportsImages ?? false,
-        strongSupportsImages: config.models?.strong?.supportsImages ?? false,
         maxInputChars: config.classification.maxInputChars,
         capsule: { status: "complete", capsule },
-        strongSticky: false,
       });
       if (admission.verdict !== "eligible") {
         reject("task_ineligible", admission.reasonCodes.join(", "));
@@ -1552,41 +1541,32 @@ export function registerSubPiTool(
 }
 
 /**
- * Resolve only the configured classifier/weak/strong. Never searches for
+ * Resolve only the configured classifier/weak. Never searches for
  * alternatives; readiness holds identity, capability booleans and reason codes.
  */
 export async function resolveConfiguredModels(
   config: ResolvedRouterConfig,
   registry: RegistryLike,
   mode: RouterMode,
-): Promise<ModelsReadiness & { resolved: { classifier?: unknown; weak?: unknown; strong?: unknown } }> {
+): Promise<ModelsReadiness & { resolved: { classifier?: unknown; weak?: unknown } }> {
   if (!config.models) {
     throw new Error(`cannot resolve models: config has no models section (mode=${mode})`);
   }
   const classifier = await resolveRole(config.models.classifier, registry);
   const weak = await resolveRole(config.models.weak, registry);
-  const strong = await resolveRole(config.models.strong, registry);
 
   const reasons: string[] = [];
   if (classifier.readiness.status !== "ok") reasons.push("classifier_unavailable");
   if (weak.readiness.status !== "ok") reasons.push("weak_unavailable");
-  if (strong.readiness.status !== "ok") reasons.push("strong_unavailable");
 
-  const strongReady = strong.readiness.status === "ok";
-  const imageFallbackUnsafe = weak.readiness.status === "ok" && weak.readiness.supportsImages &&
-    strong.readiness.status === "ok" && !strong.readiness.supportsImages;
-  if (imageFallbackUnsafe) reasons.push("image_fallback_unsafe");
-  const activeReady = strongReady && !imageFallbackUnsafe;
-  const degraded = activeReady && (classifier.readiness.status !== "ok" || weak.readiness.status !== "ok");
+  const activeReady = classifier.readiness.status === "ok" && weak.readiness.status === "ok";
   return {
-    roles: { classifier: classifier.readiness, weak: weak.readiness, strong: strong.readiness },
+    roles: { classifier: classifier.readiness, weak: weak.readiness },
     activeReady,
-    degraded,
     reasons,
     resolved: {
       classifier: classifier.readiness.status === "ok" ? classifier.model : undefined,
       weak: weak.readiness.status === "ok" ? weak.model : undefined,
-      strong: strongReady ? strong.model : undefined,
     },
   };
 }
@@ -1688,8 +1668,6 @@ export interface BatchEvaluationInput {
   target: ModelIdentityConfig | { provider: string; id: string } | null;
   actual: { provider: string; id: string } | null;
   fsExists: (path: string) => boolean;
-  weakModelFailed?: boolean;
-  capsuleInvalidated?: boolean;
 }
 
 export interface BatchEvaluation {
@@ -1788,9 +1766,6 @@ export function evaluateToolBatch(input: BatchEvaluationInput): BatchEvaluation 
     const actualKey = `${input.actual.provider}/${input.actual.id}`;
     if (targetKey !== actualKey) signals.add("actual_model_mismatch");
   }
-  if (input.weakModelFailed) signals.add("weak_model_failure");
-  if (input.capsuleInvalidated) signals.add("capsule_invalidated");
-
   return { hasToolBatch: true, signals: [...signals], progress };
 }
 
@@ -1820,7 +1795,6 @@ export interface AuditRecordInput {
   targetModel: string | null;
   actualModel: string | null;
   reasonCodes: string[];
-  upgradeSignals: string[];
   toolSummary: ToolSummary;
   actualUsage: unknown;
   expectedAcceptanceHit: boolean | null;
@@ -1846,7 +1820,6 @@ export function formatAuditRecord(input: AuditRecordInput): Record<string, unkno
     targetModel: input.targetModel,
     actualModel: input.actualModel,
     reasonCodes: input.reasonCodes.map(trim),
-    upgradeSignals: input.upgradeSignals.map(trim),
     toolSummary: input.toolSummary,
     providerLatencyMs: null,
     actualUsage: input.actualUsage ?? null,
@@ -1860,7 +1833,7 @@ export function formatAuditRecord(input: AuditRecordInput): Record<string, unkno
 
 type ModelIdentity = { provider: string; id: string };
 
-export type RouteState = "undecided" | "weak-lease" | "strong-sticky";
+export type RouteState = "undecided" | "weak-lease";
 
 interface ToolObservation {
   toolCallId: string;
@@ -1890,7 +1863,6 @@ interface RequestState {
   signals: Set<string>;
   observations: Map<string, ToolObservation>;
   verificationSucceeded: boolean;
-  lastUpgradeReason?: string;
 }
 
 interface RuntimeState {
@@ -1980,7 +1952,7 @@ export function createModelRouterExtension(dependencies: RouterDependencies = {}
       const models = state.config?.models;
       if (!models) return null;
       if (route === "weak") return { provider: models.weak.provider, id: models.weak.id };
-      if (route === "strong") return { provider: models.strong.provider, id: models.strong.id };
+      // "strong" verdict means do not intervene — target is null
       return null;
     }
 
@@ -2078,10 +2050,8 @@ export function createModelRouterExtension(dependencies: RouterDependencies = {}
         prompt: event.prompt,
         imageCount: event.images?.length ?? 0,
         weakSupportsImages: readiness?.roles.weak.supportsImages ?? false,
-        strongSupportsImages: readiness?.roles.strong.supportsImages ?? false,
         maxInputChars: state.config.classification.maxInputChars,
         capsule: capsuleResult,
-        strongSticky: false,
       });
       let classification: Classification | undefined;
       if (admission.verdict === "eligible") {
@@ -2128,30 +2098,12 @@ export function createModelRouterExtension(dependencies: RouterDependencies = {}
               };
             }
           } else {
-            // Weak unavailable → fall back to fixed strong
-            warn("model-router: weak setModel failed, falling back to fixed strong");
-            state.request.decision = { route: "strong", reasonCodes: [...state.request.decision.reasonCodes, "weak_unavailable"] };
-            state.request.targetModel = targetIdentity("strong");
-            const strongSwitched = await applySetModel(state.request.targetModel, ctx);
-            if (strongSwitched) {
-              state.request.routeState = "strong-sticky";
-            } else {
-              state.request.signals.add("strong_switch_failed");
-              warn("model-router: strong fallback also failed, aborting");
-              state.effectiveState = "error";
-              ctx.abort();
-            }
+            // Weak setModel failed — no fallback, clear routeState and let Pi continue
+            warn("model-router: weak setModel failed, continuing with current model");
+            state.request.routeState = "undecided";
           }
-        } else if (target && decision.route === "strong") {
-          const switched = await applySetModel(target, ctx);
-          if (switched) {
-            state.request.routeState = "strong-sticky";
-          } else {
-            state.request.signals.add("strong_switch_failed");
-            state.effectiveState = "error";
-            ctx.abort();
-            warn("model-router: strong switch failed, aborting");
-          }
+        } else if (decision.route === "strong") {
+          // Strong verdict means do not intervene — keep current model
         } else {
           state.effectiveState = "error";
           warn("model-router: request rejected by deterministic routing rules");
@@ -2170,7 +2122,6 @@ export function createModelRouterExtension(dependencies: RouterDependencies = {}
         targetModel: modelKey(state.request.targetModel),
         actualModel: modelKey(actualModelOf(ctx)),
         reasonCodes: state.request.decision.reasonCodes,
-        upgradeSignals: [...state.request.signals],
         toolSummary: { count: 0, errors: 0, nonzeroExits: 0, operationHashes: [] },
         actualUsage: null,
         expectedAcceptanceHit: null,
@@ -2216,24 +2167,6 @@ export function createModelRouterExtension(dependencies: RouterDependencies = {}
       }
     }
 
-    async function upgradeRequestToStrong(
-      request: RequestState,
-      reason: string,
-      ctx: ExtensionContext,
-    ): Promise<void> {
-      const switched = await applySetModel(targetIdentity("strong"), ctx);
-      if (!switched) {
-        request.signals.add("strong_switch_failed");
-        state.effectiveState = "error";
-        warn("model-router: strong switch failed during continuation, aborting");
-        ctx.abort();
-        return;
-      }
-      request.routeState = "strong-sticky";
-      request.targetModel = targetIdentity("strong");
-      request.lastUpgradeReason = reason;
-    }
-
     async function onTurnEnd(
       event: { turnIndex: number; message: Record<string, unknown>; toolResults: Array<{ toolCallId: string }> },
       ctx: ExtensionContext,
@@ -2250,10 +2183,6 @@ export function createModelRouterExtension(dependencies: RouterDependencies = {}
         .filter((observation): observation is ToolObservation => observation !== undefined);
 
       if (batch.length === 0) {
-        if (state.runtimeMode === "active" && request.routeState === "weak-lease" && message.stopReason === "error") {
-          request.signals.add("weak_model_failure");
-          await upgradeRequestToStrong(request, "weak_model_failure", ctx);
-        }
         const artifactsPresent = request.capsule
           ? checkExpectedArtifacts(request.capsule, (path) => fs.exists(path)).missing.length === 0
           : false;
@@ -2269,7 +2198,6 @@ export function createModelRouterExtension(dependencies: RouterDependencies = {}
           targetModel: modelKey(request.targetModel),
           actualModel: modelKey(actual),
           reasonCodes: request.decision.reasonCodes,
-          upgradeSignals: [...request.signals],
           toolSummary: { count: 0, errors: 0, nonzeroExits: 0, operationHashes: [] },
           actualUsage: message.usage ?? null,
           expectedAcceptanceHit: request.verificationSucceeded && artifactsPresent,
@@ -2308,9 +2236,6 @@ export function createModelRouterExtension(dependencies: RouterDependencies = {}
         request.noProgressCount = evalState.noProgressCount;
         request.weakContinuationCount = evalState.weakContinuationCount;
         for (const signal of evaluation.signals) request.signals.add(signal);
-        if (state.runtimeMode === "active" && evaluation.signals.length > 0) {
-          await upgradeRequestToStrong(request, evaluation.signals[0], ctx);
-        }
       }
 
       const artifactsPresent = request.capsule
@@ -2328,7 +2253,6 @@ export function createModelRouterExtension(dependencies: RouterDependencies = {}
         targetModel: modelKey(request.targetModel),
         actualModel: modelKey(actual),
         reasonCodes: request.decision.reasonCodes,
-        upgradeSignals: [...request.signals],
         toolSummary: toolSummaryOf(batch),
         actualUsage: message.usage ?? null,
         expectedAcceptanceHit: request.verificationSucceeded && artifactsPresent,
@@ -2348,9 +2272,7 @@ export function createModelRouterExtension(dependencies: RouterDependencies = {}
       if (request.capsule?.verification.length && !request.verificationSucceeded) {
         request.signals.add("acceptance_missing_after_work");
       }
-      if (state.runtimeMode === "active" && request.routeState === "weak-lease" && request.signals.size > 0) {
-        await upgradeRequestToStrong(request, [...request.signals][0], ctx);
-      }
+      // Active mode: no upgrade — signals are recorded but model is not switched
       if (state.config && request.signals.size > 0) {
         appendAudit(formatAuditRecord({
           timestamp: now().toISOString(),
@@ -2364,7 +2286,6 @@ export function createModelRouterExtension(dependencies: RouterDependencies = {}
           targetModel: modelKey(request.targetModel),
           actualModel: modelKey(actualModelOf(ctx)),
           reasonCodes: request.decision.reasonCodes,
-          upgradeSignals: [...request.signals],
           toolSummary: { count: 0, errors: 0, nonzeroExits: 0, operationHashes: [] },
           actualUsage: null,
           expectedAcceptanceHit: false,
@@ -2520,7 +2441,7 @@ export function createModelRouterExtension(dependencies: RouterDependencies = {}
       }
       const readiness = await ensureReadiness(ctx);
       if (!readiness?.activeReady) {
-        const reasons = readiness?.reasons ?? ["strong unavailable or auth missing"];
+        const reasons = readiness?.reasons ?? ["classifier or weak unavailable"];
         notify(ctx, `model-router: cannot enable active - ${reasons.join("; ")}`, "error");
         return;
       }
@@ -2535,15 +2456,14 @@ export function createModelRouterExtension(dependencies: RouterDependencies = {}
       await captureAndRegisterHandlers();
       captureActivationModel(ctx);
       state.runtimeMode = "active";
-      state.effectiveState = readiness.degraded ? "active-ready" : "active-ready";
+      state.effectiveState = "active-ready";
       // Append state entry
       pi.appendEntry("model-router-state", {
         version: 1,
         mode: "active",
         activationModel: state.activationModel ? { provider: state.activationModel.provider, id: state.activationModel.id } : null,
       });
-      const degradedNote = readiness.degraded ? " (degraded: all-strong)" : "";
-      notify(ctx, `model-router: active mode enabled${degradedNote}`, "info");
+      notify(ctx, "model-router: active mode enabled", "info");
     }
 
     // -----------------------------------------------------------------------
@@ -2668,9 +2588,6 @@ function statusBarText(state: RuntimeState): string | undefined {
     const cap = state.config?.limits.maxWeakContinuationTurns ?? 0;
     return `routing:active · weak · turn=${request.weakContinuationCount}/${cap}`;
   }
-  if (request?.routeState === "strong-sticky" && request.lastUpgradeReason) {
-    return `routing:active · strong · upgraded=${request.lastUpgradeReason}`;
-  }
   return `routing:active · strong`;
 }
 
@@ -2693,7 +2610,6 @@ function reportStatus(state: RuntimeState, configPath: string, ctx: ExtensionCom
   if (models) {
     lines.push(`classifier model: ${models.classifier.provider}/${models.classifier.id}`);
     lines.push(`weak model: ${models.weak.provider}/${models.weak.id}`);
-    lines.push(`strong model: ${models.strong.provider}/${models.strong.id}`);
   }
   if (state.config) {
     lines.push(`log directory: ${state.config.logging.directory}`);
@@ -2710,9 +2626,7 @@ function reportStatus(state: RuntimeState, configPath: string, ctx: ExtensionCom
     if (request.targetModel) {
       lines.push(`target model: ${request.targetModel.provider}/${request.targetModel.id}`);
     }
-    if (request.lastUpgradeReason) {
-      lines.push(`upgrade reason: ${request.lastUpgradeReason}`);
-    }
+
   }
   if (state.configResult.kind === "invalid") {
     lines.push(`config errors: ${state.configResult.errors.join("; ")}`);

@@ -2,21 +2,8 @@
   "version": 1,
   "mode": "off",
   "models": {
-    "classifier": {
-      "provider": "opencode",
-      "id": "deepseek-v4-flash-free",
-      "supportsImages": false
-    },
-    "weak": {
-      "provider": "opencode",
-      "id": "mimo-v2.5-free",
-      "supportsImages": true
-    },
-    "strong": {
-      "provider": "anthropic",
-      "id": "claude-opus-4-6",
-      "supportsImages": true
-    }
+    "classifier": { "provider": "deepseek", "id": "deepseek-v4-flash", "supportsImages": false },
+    "weak": { "provider": "google", "id": "gemini-3.5-flash", "supportsImages": true }
   },
   "classification": {
     "ruleProfile": "conservative-v1",
@@ -32,10 +19,5 @@
   "logging": {
     "directory": "~/.pi/agent/model-router-logs",
     "maxReasonChars": 240
-  },
-  "subPi": {
-    "enabled": false,
-    "maxConcurrent": 1,
-    "timeoutMs": 1800000
   }
 }

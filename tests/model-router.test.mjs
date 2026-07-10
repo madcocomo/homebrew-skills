@@ -453,7 +453,6 @@ function baseConfig(overrides = {}) {
     models: {
       classifier: { provider: "opencode", id: "deepseek-v4-flash-free", supportsImages: false },
       weak: { provider: "opencode", id: "mimo-v2.5-free", supportsImages: true },
-      strong: { provider: "anthropic", id: "claude-opus-4-6", supportsImages: true },
     },
     ...overrides,
   };
@@ -521,11 +520,10 @@ test("config: bad version, mode, identity, url/token fields, non-boolean support
     baseConfig({ mode: "on" }),
     baseConfig({ models: { ...baseConfig().models, weak: { provider: "", id: "x", supportsImages: true } } }),
     baseConfig({ models: { ...baseConfig().models, weak: { provider: "p", id: "", supportsImages: true } } }),
-    baseConfig({ models: { classifier: baseConfig().models.classifier, weak: baseConfig().models.weak } }),
     baseConfig({
       models: {
         ...baseConfig().models,
-        strong: { provider: "anthropic", id: "claude-opus-4-6", supportsImages: true, baseUrl: "https://x" },
+        weak: { provider: "opencode", id: "mimo-v2.5-free", supportsImages: true, baseUrl: "https://x" },
       },
     }),
     baseConfig({
@@ -637,15 +635,14 @@ async function resolveWith({ registryModels, auth, config, mode }) {
   return { readiness, harness };
 }
 
-test("model resolver: exactly three exact find calls, no candidate discovery", async () => {
+test("model resolver: exactly two exact find calls (classifier + weak), no candidate discovery", async () => {
   const { readiness, harness } = await resolveWith({ registryModels: FIXED_MODELS });
-  assert.equal(harness.registryFindCalls.length, 3);
+  assert.equal(harness.registryFindCalls.length, 2);
   assert.deepEqual(
     harness.registryFindCalls.map((c) => `${c.provider}/${c.id}`).sort(),
-    ["anthropic/claude-opus-4-6", "opencode/deepseek-v4-flash-free", "opencode/mimo-v2.5-free"],
+    ["opencode/deepseek-v4-flash-free", "opencode/mimo-v2.5-free"],
   );
   assert.equal(readiness.activeReady, true);
-  assert.equal(readiness.degraded, false);
 });
 
 test("model resolver: declared true + registry image -> supported; declared false stays conservative", async () => {
@@ -664,56 +661,34 @@ test("model resolver: declared true but registry lacks image is a config error",
   const models = [
     fakeModel("opencode", "deepseek-v4-flash-free", ["text"]),
     fakeModel("opencode", "mimo-v2.5-free", ["text"]), // no image despite declaration
-    fakeModel("anthropic", "claude-opus-4-6", ["text", "image"]),
   ];
   const { readiness } = await resolveWith({ registryModels: models });
   assert.equal(readiness.roles.weak.status, "image_capability_mismatch");
-
-  // strong image mismatch must block active readiness
-  const models2 = [
-    fakeModel("opencode", "deepseek-v4-flash-free", ["text"]),
-    fakeModel("opencode", "mimo-v2.5-free", ["text", "image"]),
-    fakeModel("anthropic", "claude-opus-4-6", ["text"]),
-  ];
-  const { readiness: r2 } = await resolveWith({ registryModels: models2 });
-  assert.equal(r2.roles.strong.status, "image_capability_mismatch");
-  assert.equal(r2.activeReady, false);
 });
 
-test("model resolver: active rejects an image-capable weak model without strong image fallback", async () => {
-  const config = baseConfig({ mode: "active" });
-  config.models.strong.supportsImages = false;
-  const { readiness } = await resolveWith({ registryModels: FIXED_MODELS, config });
-  assert.equal(readiness.roles.weak.supportsImages, true);
-  assert.equal(readiness.roles.strong.supportsImages, false);
-  assert.equal(readiness.activeReady, false);
-  assert.ok(readiness.reasons.includes("image_fallback_unsafe"));
-});
-
-test("model resolver: active requires resolvable strong with auth ok", async () => {
-  // strong missing from registry
+test("model resolver: active requires classifier and weak resolvable with auth ok", async () => {
+  // classifier missing from registry
   const { readiness } = await resolveWith({
-    registryModels: FIXED_MODELS.filter((m) => m.provider !== "anthropic"),
+    registryModels: FIXED_MODELS.filter((m) => m.id !== "deepseek-v4-flash-free"),
   });
-  assert.equal(readiness.roles.strong.status, "not_found");
+  assert.equal(readiness.roles.classifier.status, "not_found");
   assert.equal(readiness.activeReady, false);
 
-  // strong present but no credentials
+  // weak present but no credentials
   const { readiness: r2 } = await resolveWith({
     registryModels: FIXED_MODELS,
-    auth: { "anthropic/claude-opus-4-6": false },
+    auth: { "opencode/mimo-v2.5-free": false },
   });
-  assert.equal(r2.roles.strong.status, "auth_missing");
+  assert.equal(r2.roles.weak.status, "auth_missing");
   assert.equal(r2.activeReady, false);
 });
 
-test("model resolver: degraded all-strong when classifier/weak unavailable, reasons explicit", async () => {
+test("model resolver: missing classifier or weak blocks active readiness with explicit reasons", async () => {
   const { readiness } = await resolveWith({
     registryModels: FIXED_MODELS,
     auth: { "opencode/deepseek-v4-flash-free": false, "opencode/mimo-v2.5-free": false },
   });
-  assert.equal(readiness.activeReady, true);
-  assert.equal(readiness.degraded, true);
+  assert.equal(readiness.activeReady, false);
   assert.ok(readiness.reasons.includes("classifier_unavailable"));
   assert.ok(readiness.reasons.includes("weak_unavailable"));
 
@@ -721,8 +696,7 @@ test("model resolver: degraded all-strong when classifier/weak unavailable, reas
   const { readiness: r2 } = await resolveWith({
     registryModels: FIXED_MODELS.filter((m) => m.id !== "mimo-v2.5-free"),
   });
-  assert.equal(r2.activeReady, true);
-  assert.equal(r2.degraded, true);
+  assert.equal(r2.activeReady, false);
   assert.equal(r2.roles.weak.status, "not_found");
 });
 
@@ -730,7 +704,7 @@ test("model resolver: readiness carries no auth material, only identity/capabili
   const { readiness } = await resolveWith({ registryModels: FIXED_MODELS });
   const serialized = JSON.stringify(readiness);
   assert.ok(!serialized.includes("unit-test-fake"), "readiness must not contain api keys");
-  for (const role of ["classifier", "weak", "strong"]) {
+  for (const role of ["classifier", "weak"]) {
     assert.deepEqual(
       Object.keys(readiness.roles[role]).sort(),
       ["id", "provider", "status", "supportsImages"].sort(),
@@ -740,7 +714,7 @@ test("model resolver: readiness carries no auth material, only identity/capabili
 
 test("model resolver: shadow resolves fixed models and records readiness without setModel", async () => {
   const { readiness, harness } = await resolveWith({ registryModels: FIXED_MODELS, mode: "shadow" });
-  assert.equal(harness.registryFindCalls.length, 3);
+  assert.equal(harness.registryFindCalls.length, 2);
   assert.equal(harness.setModelCalls.length, 0);
   assert.equal(readiness.roles.weak.status, "ok");
 });
@@ -920,10 +894,8 @@ async function admissionOf(overrides = {}) {
     prompt,
     imageCount: overrides.imageCount ?? 0,
     weakSupportsImages: overrides.weakSupportsImages ?? true,
-    strongSupportsImages: overrides.strongSupportsImages ?? true,
     maxInputChars: overrides.maxInputChars ?? 12000,
     capsule,
-    strongSticky: overrides.strongSticky ?? false,
   });
 }
 
@@ -937,10 +909,6 @@ test("admission: table-driven reason codes with fixed priority reject > strong >
   const tooLarge = await admissionOf({ maxInputChars: 10 });
   assert.equal(tooLarge.verdict, "strong");
   assert.ok(tooLarge.reasonCodes.includes("classifier_input_too_large"));
-
-  const sticky = await admissionOf({ strongSticky: true });
-  assert.equal(sticky.verdict, "strong");
-  assert.ok(sticky.reasonCodes.includes("strong_sticky"));
 
   const ambiguous = await admissionOf({ prompt: "just fix whatever is broken please" });
   assert.equal(ambiguous.verdict, "strong");
@@ -961,13 +929,12 @@ test("admission: table-driven reason codes with fixed priority reject > strong >
   // multiple simultaneous hits: stable sorted reason codes, reject wins
   const multi = await admissionOf({
     prompt: FULL_TASK_PROMPT.replace("src/utils/date.ts,", "../outside.ts,"),
-    strongSticky: true,
     maxInputChars: 10,
   });
   assert.equal(multi.verdict, "reject");
   const sortedCopy = [...multi.reasonCodes].sort();
   assert.deepEqual(multi.reasonCodes, sortedCopy, "reasonCodes must be stably sorted");
-  assert.ok(multi.reasonCodes.length >= 3);
+  assert.ok(multi.reasonCodes.length >= 2, `expected >=2 reason codes, got ${multi.reasonCodes.length}: ${JSON.stringify(multi.reasonCodes)}`);
 });
 
 test("admission: edit/write/git/process restart do not trigger strong by themselves", async () => {
@@ -1032,31 +999,17 @@ test("admission: cross-boundary write scope pushes strong", async () => {
 
 test("admission: image matrix matches the design", async () => {
   // no images -> normal rules
-  const none = await admissionOf({ imageCount: 0, weakSupportsImages: false, strongSupportsImages: false });
+  const none = await admissionOf({ imageCount: 0, weakSupportsImages: false });
   assert.equal(none.verdict, "eligible");
 
-  // images, weak yes, strong yes -> still normal rules (can be eligible)
+  // images, weak supports -> normal rules (can be eligible)
   const both = await admissionOf({ imageCount: 1 });
   assert.equal(both.verdict, "eligible");
 
-  // images, weak no, strong yes -> hard strong
+  // images, weak does not support -> strong (no intervention)
   const weakNo = await admissionOf({ imageCount: 1, weakSupportsImages: false });
   assert.equal(weakNo.verdict, "strong");
-  assert.ok(weakNo.reasonCodes.includes("image_requires_strong"));
-
-  // images, weak yes, strong no -> unsafe fallback, reject
-  const strongNo = await admissionOf({ imageCount: 1, strongSupportsImages: false });
-  assert.equal(strongNo.verdict, "reject");
-  assert.ok(strongNo.reasonCodes.includes("image_fallback_unsafe"));
-
-  // images, weak no, strong no -> reject
-  const neither = await admissionOf({
-    imageCount: 1,
-    weakSupportsImages: false,
-    strongSupportsImages: false,
-  });
-  assert.equal(neither.verdict, "reject");
-  assert.ok(neither.reasonCodes.includes("no_configured_image_model"));
+  assert.ok(weakNo.reasonCodes.includes("image_not_supported_by_weak"));
 });
 
 // ---------------------------------------------------------------------------
@@ -1083,10 +1036,8 @@ test("classifier protocol: input contains only the allowed compact fields", asyn
     prompt: FULL_TASK_PROMPT,
     imageCount: 1,
     weakSupportsImages: true,
-    strongSupportsImages: true,
     maxInputChars: 12000,
     capsule: capsuleResult,
-    strongSticky: false,
   });
   const input = module.buildClassifierInput({
     requestId: "req-1",
@@ -1315,7 +1266,7 @@ test("shadow: hard strong target skips classifier entirely; reject also logged",
   await emitStart(harness, "please just fix whatever seems broken");
   assert.equal(harness.classifierCalls.length, 0);
   let records = readLogRecords(harness);
-  assert.equal(records.at(-1).targetModel, "anthropic/claude-opus-4-6");
+  assert.equal(records.at(-1).targetModel, null, "strong verdict means no target model");
   assert.equal(harness.setModelCalls.length, 0);
 
   await emitStart(harness, FULL_TASK_PROMPT.replace("src/utils/date.ts,", "../escape.ts,"));
@@ -1467,8 +1418,6 @@ async function runBatch(items, overrides = {}) {
     target: overrides.target ?? { provider: "opencode", id: "mimo-v2.5-free" },
     actual: overrides.actual ?? { provider: "opencode", id: "mimo-v2.5-free" },
     fsExists: overrides.fsExists ?? (() => false),
-    weakModelFailed: overrides.weakModelFailed ?? false,
-    capsuleInvalidated: overrides.capsuleInvalidated ?? false,
   });
 }
 
@@ -1612,11 +1561,6 @@ test("effect evaluator: artifact/acceptance/turn-cap/mismatch/failure/invalidati
   });
   assert.ok(mismatch.signals.includes("actual_model_mismatch"));
 
-  const failed = await runBatch([batchItem(module)], { weakModelFailed: true });
-  assert.ok(failed.signals.includes("weak_model_failure"));
-
-  const invalidated = await runBatch([batchItem(module)], { capsuleInvalidated: true });
-  assert.ok(invalidated.signals.includes("capsule_invalidated"));
 });
 
 test("effect evaluator: signals are unique, stably ordered, and empty batch means no continuation", async () => {
@@ -1678,7 +1622,7 @@ test("active initial: weak route calls setModel(fixedWeak) before provider reque
     "setModel must happen before provider request, got index setModel=" + setModelIdx + " req=" + reqIdx);
 });
 
-test("active initial: hard strong/classifier failure only sets fixed strong", async () => {
+test("active initial: hard strong/classifier failure does not call setModel (no intervention)", async () => {
   const harness = await setupActive({}, { classify: async () => { throw new Error("classifier fail"); } });
   await harness.emit("before_agent_start", {
     type: "before_agent_start",
@@ -1686,12 +1630,11 @@ test("active initial: hard strong/classifier failure only sets fixed strong", as
     systemPrompt: "",
     systemPromptOptions: {},
   });
-  // classifier fails → strong
-  assert.equal(harness.setModelCalls.length, 1);
-  assert.equal(harness.setModelCalls[0].provider, "anthropic");
+  // classifier fails → strong verdict → no intervention, no setModel
+  assert.equal(harness.setModelCalls.length, 0);
 });
 
-test("active initial: hard rule prompt (scope ambiguous) only sets fixed strong", async () => {
+test("active initial: hard rule prompt (scope ambiguous) does not call setModel (no intervention)", async () => {
   const harness = await setupActive();
   await harness.emit("before_agent_start", {
     type: "before_agent_start",
@@ -1699,12 +1642,11 @@ test("active initial: hard rule prompt (scope ambiguous) only sets fixed strong"
     systemPrompt: "",
     systemPromptOptions: {},
   });
-  assert.equal(harness.setModelCalls.length, 1);
-  assert.equal(harness.setModelCalls[0].provider, "anthropic");
+  assert.equal(harness.setModelCalls.length, 0);
   assert.equal(harness.classifierCalls.length, 0);
 });
 
-test("active initial: weak setModel false / throw falls back to fixed strong", async () => {
+test("active initial: weak setModel false does not fallback, no abort", async () => {
   const harness = await setupActive({
     setModelResults: { "opencode/mimo-v2.5-free": false },
   });
@@ -1714,19 +1656,14 @@ test("active initial: weak setModel false / throw falls back to fixed strong", a
     systemPrompt: "",
     systemPromptOptions: {},
   });
-  assert.equal(harness.setModelCalls.length, 2, "must try weak then strong");
+  assert.equal(harness.setModelCalls.length, 1, "only try weak once");
   assert.equal(harness.setModelCalls[0].provider, "opencode");
-  assert.equal(harness.setModelCalls[1].provider, "anthropic");
-  assert.equal(harness.abortCalls, 0, "weak fallback to strong is not abort");
+  assert.equal(harness.abortCalls, 0, "weak failure is not abort");
 });
 
-test("active initial: strong setModel failure aborts", async () => {
+test("active initial: setModel failure does not abort", async () => {
   const harness = await setupActive({
-    // Both weak and strong failing: weak setModel fails → fallback to strong → strong also fails
-    setModelResults: {
-      "opencode/mimo-v2.5-free": false,
-      "anthropic/claude-opus-4-6": new Error("auth fail"),
-    },
+    setModelResults: { "opencode/mimo-v2.5-free": false },
   });
   await harness.emit("before_agent_start", {
     type: "before_agent_start",
@@ -1734,7 +1671,7 @@ test("active initial: strong setModel failure aborts", async () => {
     systemPrompt: "",
     systemPromptOptions: {},
   });
-  assert.equal(harness.abortCalls, 1, "strong switch failure must abort");
+  assert.equal(harness.abortCalls, 0, "weak setModel failure must not abort");
 });
 
 test("active initial: weak route injects capsule message", async () => {
@@ -1771,7 +1708,7 @@ test("weak lease: healthy continuation keeps weak without setModel re-call", asy
   assert.equal(harness.setModelCalls.length, setModelBefore, "healthy continuation must not switch model");
 });
 
-test("weak lease: signal in turn_end switches to strong before next request", async () => {
+test("weak lease: signal in turn_end does not switch model (no upgrade)", async () => {
   const harness = await setupActive();
   await emitStart(harness);
   const setModelBefore = harness.setModelCalls.length;
@@ -1784,9 +1721,7 @@ test("weak lease: signal in turn_end switches to strong before next request", as
     details: { exitCode: 1 },
   });
   await emitTurnEnd(harness, { toolResultIds: ["t1"] });
-  assert.equal(harness.setModelCalls.length, setModelBefore + 1, "signal should trigger strong switch");
-  const lastSetModel = harness.setModelCalls[harness.setModelCalls.length - 1];
-  assert.equal(lastSetModel.provider, "anthropic");
+  assert.equal(harness.setModelCalls.length, setModelBefore, "signals are recorded but model is not switched");
 });
 
 test("weak lease: turn_end with no tools does not trigger switch (run ends)", async () => {
@@ -1797,52 +1732,7 @@ test("weak lease: turn_end with no tools does not trigger switch (run ends)", as
   assert.equal(harness.setModelCalls.length, setModelBefore, "no tools means no continuation, no switch");
 });
 
-test("strong sticky: no strong→weak within same run", async () => {
-  const harness = await setupActive();
-  await emitStart(harness);
-  // First turn set weak
-  assert.equal(harness.setModelCalls.length, 1);
-  assert.equal(harness.setModelCalls[0].provider, "opencode");
-  // Trigger an error to force upgrade
-  await emitToolPair(harness, {
-    id: "t1",
-    toolName: "bash",
-    input: { command: "node --test tests/date.test.mjs" },
-    isError: true,
-    details: { exitCode: 1 },
-  });
-  await emitTurnEnd(harness, { toolResultIds: ["t1"] });
-  assert.equal(harness.setModelCalls.length, 2);
-  assert.equal(harness.setModelCalls[1].provider, "anthropic");
-  // Second turn: still in same request, should not downgrade
-  await emitToolPair(harness, {
-    id: "t2",
-    toolName: "read",
-    input: { path: `${REPO}/tests/date.test.mjs` },
-    text: "updated",
-  });
-  await emitTurnEnd(harness, { turnIndex: 1, toolResultIds: ["t2"] });
-  // Only 2 setModel calls (first weak, then strong upgrade), no downgrade
-  assert.equal(harness.setModelCalls.length, 2, "strong-sticky must not downgrade");
-});
-
-test("strong sticky: new request resets and can re-enter weak", async () => {
-  const harness = await setupActive();
-  // Request 1: weak then upgrade
-  await emitStart(harness);
-  await emitToolPair(harness, {
-    id: "t1", toolName: "bash",
-    input: { command: "failing" }, isError: true, details: { exitCode: 1 },
-  });
-  await emitTurnEnd(harness, { toolResultIds: ["t1"] });
-  assert.equal(harness.setModelCalls.length, 2);
-  // Request 2: new start should reset and go weak again
-  await emitStart(harness, "Objective: another task\nAllowed write: src/b.ts\nSteps:\n1. edit b.ts\nArtifacts: src/b.ts\nVerification: `node --test`");
-  assert.equal(harness.setModelCalls.length, 3, "new request should set weak again");
-  assert.equal(harness.setModelCalls[2].provider, "opencode");
-});
-
-test("active: actual model mismatch triggers upgrade on next continuation", async () => {
+test("active: actual model mismatch is recorded but does not trigger model switch", async () => {
   const harness = await setupActive();
   await emitStart(harness);
   const setModelBefore = harness.setModelCalls.length;
@@ -1856,7 +1746,7 @@ test("active: actual model mismatch triggers upgrade on next continuation", asyn
     toolResultIds: ["t1"],
     model: "opencode/deepseek-v4-flash-free", // classifier model, not weak target
   });
-  assert.equal(harness.setModelCalls.length, setModelBefore + 1, "mismatch should trigger strong");
+  assert.equal(harness.setModelCalls.length, setModelBefore, "mismatch does not trigger model switch");
 });
 
 // ---------------------------------------------------------------------------
@@ -1888,9 +1778,9 @@ test("/routing: first off→shadow captures activation snapshot", async () => {
   assert.ok(/effective[^\n]*shadow/i.test(text), "effective mode should be shadow");
 });
 
-test("/routing: active validates strong readiness before enabling", async () => {
-  // Strong unresolvable
-  const partialModels = FIXED_MODELS.filter((m) => m.id !== "claude-opus-4-6");
+test("/routing: active validates readiness before enabling", async () => {
+  // Missing weak → should reject active
+  const partialModels = FIXED_MODELS.filter((m) => m.id !== "mimo-v2.5-free");
   const harness = createHarness({ registryModels: partialModels, cwd: REPO });
   await setupExtension(harness, {
     files: { [CONFIG_PATH]: JSON.stringify(baseConfig({ mode: "shadow" })) },
@@ -1898,7 +1788,7 @@ test("/routing: active validates strong readiness before enabling", async () => 
   });
   await harness.runCommand("routing", "active");
   const text = harness.notifications.map((n) => n.message).join("\n");
-  assert.ok(text.includes("unavailable") || text.includes("not"), "should reject active when strong missing");
+  assert.ok(text.includes("unavailable") || text.includes("cannot"), "should reject active when weak missing");
   // Should still be in shadow mode, not active
 });
 
@@ -1976,7 +1866,7 @@ test("/routing: status displays config path, modes, snapshot, lease", async () =
   assert.ok(text.includes("target model") || text.includes("opencode/mimo"), "target");
   assert.match(text, /classifier model: opencode\/deepseek-v4-flash-free/);
   assert.match(text, /weak model: opencode\/mimo-v2.5-free/);
-  assert.match(text, /strong model: anthropic\/claude-opus-4-6/);
+  assert.ok(!/strong model/.test(text), "strong model line removed");
   assert.match(text, /log directory:/);
   assert.match(text, /sub-pi: disabled/);
 });
@@ -2058,11 +1948,12 @@ test("integration: full active lifecycle initial weak, healthy continuation, upg
   // Upgrade on error
   await emitToolPair(harness, { id: "t2", toolName: "bash", input: { command: "make" }, isError: true, details: { exitCode: 2 } });
   await emitTurnEnd(harness, { turnIndex: 1, toolResultIds: ["t2"] });
-  assert.equal(harness.setModelCalls.length, 2, "error triggers upgrade");
-  assert.equal(harness.setModelCalls[1].provider, "anthropic");
+  // No upgrade on error — signals recorded but model not switched
+  assert.equal(harness.setModelCalls.length, 1, "error does not trigger switch");
+  assert.equal(harness.setModelCalls[0]?.provider, "opencode");
 });
 
-test("integration: all specified upgrade signals trigger 100% strong switch", async () => {
+test("integration: signals are recorded but never trigger model switch", async () => {
   const signals = [
     { name: "tool_error", item: { isError: true } },
     { name: "nonzero_exit", item: { toolName: "bash", input: { command: "make" }, exitCode: 1 } },
@@ -2079,9 +1970,8 @@ test("integration: all specified upgrade signals trigger 100% strong switch", as
       text: "x",
     });
     await emitTurnEnd(harness, { toolResultIds: ["t1"] });
-    assert.equal(harness.setModelCalls.length, before + 1,
-      `signal "${name}" must trigger strong upgrade`);
-    assert.equal(harness.setModelCalls[harness.setModelCalls.length - 1].provider, "anthropic");
+    assert.equal(harness.setModelCalls.length, before,
+      `signal "${name}" must not trigger model switch`);
   }
 });
 
@@ -2591,12 +2481,9 @@ test("Gate 15: child failure triggers parent route upgrade via evaluator", async
     toolResults: [{ role: "toolResult", toolCallId: "subpi-1" }],
   });
 
-  // Parent must upgrade to strong (not launch another child)
-  assert.equal(harness.setModelCalls.length, setModelBefore + 1,
-    "child failure must trigger parent strong upgrade");
-  const lastModel = harness.setModelCalls[harness.setModelCalls.length - 1];
-  assert.equal(lastModel.provider, "anthropic",
-    "parent must upgrade to configured fixed strong, not child strong");
+  // Signals recorded, model not switched
+  assert.equal(harness.setModelCalls.length, setModelBefore,
+    "child failure records signals but does not switch model");
   // No second child runner call (parent didn't retry with another model)
   // Only one child call should have happened
   assert.equal(harness.childCalls.length, 1, "child must be called exactly once, no retry");
@@ -2676,7 +2563,7 @@ test("session shutdown restores the activation model after an active weak route"
 test("active hard reject aborts instead of continuing on an arbitrary model", async () => {
   const config = baseConfig({ mode: "active" });
   config.models.weak.supportsImages = false;
-  config.models.strong.supportsImages = false;
+  // images + weakSupportsImages=false → strong verdict (no intervention), not abort
   const harness = createHarness({ registryModels: FIXED_MODELS, cwd: REPO });
   await setupExtension(harness, {
     files: { [CONFIG_PATH]: JSON.stringify(config) },
@@ -2689,7 +2576,7 @@ test("active hard reject aborts instead of continuing on an arbitrary model", as
     systemPrompt: "",
     systemPromptOptions: {},
   });
-  assert.equal(harness.abortCalls, 1);
+  assert.equal(harness.abortCalls, 0);
   assert.equal(harness.setModelCalls.length, 0);
 });
 
@@ -2709,9 +2596,9 @@ test("no-tool weak model failure is upgraded and audited at turn_end", async () 
     },
     toolResults: [],
   });
-  assert.equal(harness.setModelCalls.at(-1).provider, "anthropic");
-  const records = harness.fs.files.get(LOG_FILE).trim().split("\n").map(JSON.parse);
-  assert.ok(records.at(-1).upgradeSignals.includes("weak_model_failure"));
+  assert.equal(harness.setModelCalls.length, 1, "weak model failure does not trigger switch");
+  const records = readLogRecords(harness);
+  assert.ok(records.length >= 2, "should have initial + completion records");
 });
 
 test("agent end upgrades an unverified weak task to fixed strong", async () => {
@@ -2719,8 +2606,8 @@ test("agent end upgrades an unverified weak task to fixed strong", async () => {
   await emitStart(harness);
   const before = harness.setModelCalls.length;
   await harness.emit("agent_end", { type: "agent_end", messages: [] });
-  assert.equal(harness.setModelCalls.length, before + 1);
-  assert.equal(harness.setModelCalls.at(-1).provider, "anthropic");
+  assert.equal(harness.setModelCalls.length, before);
+  assert.equal(harness.setModelCalls.length, 1, "weak model failure does not trigger switch");
 });
 
 test("weak turn limit upgrades when the configured limit is reached", async () => {

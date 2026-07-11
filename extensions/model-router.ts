@@ -1036,8 +1036,21 @@ export type ClassifierParse =
   | { ok: false; code: string };
 
 export type Classification =
-  | { status: "ok"; classification: ClassifierResult; latencyMs?: number }
-  | { status: "failed"; code: string };
+  | {
+      status: "ok";
+      classification: ClassifierResult;
+      latencyMs?: number;
+      classifierModel?: string;
+      attemptCount?: number;
+      failureCodes?: string[];
+    }
+  | {
+      status: "failed";
+      code: string;
+      classifierModel?: string;
+      attemptCount?: number;
+      failureCodes?: string[];
+    };
 
 /**
  * Build the compact classification record. Never includes image binaries,
@@ -2111,8 +2124,9 @@ export interface AuditRecordInput {
   decisionKind: "initial" | "continuation" | "completion";
   admission: { verdict: AdmissionVerdict; reasonCodes: string[] };
   classification:
-    | { status: "ok"; route: string; confidence: number; riskFlags: string[]; reasonCode: string; latencyMs: number | null }
-    | { status: "failed"; code: string }
+    | { status: "ok"; route: string; confidence: number; riskFlags: string[]; reasonCode: string; latencyMs: number | null;
+        classifierModel?: string; attemptCount?: number; failureCodes?: string[] }
+    | { status: "failed"; code: string; classifierModel?: string; attemptCount?: number; failureCodes?: string[] }
     | { status: "skipped" };
   targetModel: string | null;
   actualModel: string | null;
@@ -2208,6 +2222,11 @@ function modelKey(model: ModelIdentity | null | undefined): string | null {
   return model ? `${model.provider}/${model.id}` : null;
 }
 
+function classifierFailureReason(error: unknown): CooldownReason {
+  const value = error as { name?: string; code?: string };
+  return value?.name === "TimeoutError" || value?.code === "ETIMEDOUT" ? "timeout" : "provider_error";
+}
+
 export function createModelRouterExtension(dependencies: RouterDependencies = {}) {
   const agentDir = dependencies.agentDir ?? getAgentDir();
   const fs = dependencies.fs ?? createNodeFs();
@@ -2229,6 +2248,7 @@ export function createModelRouterExtension(dependencies: RouterDependencies = {}
       handlersRegistered: false,
       logWarned: false,
     };
+    const health = createModelHealthStore({ fs, agentDir, now, randomId, warn });
 
     // -----------------------------------------------------------------------
     // Audit logging (best effort, rate-limited warning)
@@ -2256,8 +2276,13 @@ export function createModelRouterExtension(dependencies: RouterDependencies = {}
     // -----------------------------------------------------------------------
 
     async function ensureReadiness(ctx: ExtensionContext): Promise<RuntimeState["readiness"]> {
-      if (!state.readiness && state.config?.models) {
-        state.readiness = await resolveConfiguredModels(state.config, ctx.modelRegistry, state.runtimeMode);
+      if (state.config?.models) {
+        state.readiness = await resolveConfiguredModels(
+          state.config,
+          ctx.modelRegistry,
+          state.runtimeMode,
+          health,
+        );
       }
       return state.readiness;
     }
@@ -2289,6 +2314,39 @@ export function createModelRouterExtension(dependencies: RouterDependencies = {}
       };
     }
 
+    async function runClassifierAttempt(
+      model: unknown,
+      input: ClassifierInput,
+      timeoutMs: number,
+      ctx: ExtensionContext,
+    ): Promise<
+      | { kind: "ok"; classification: ClassifierResult }
+      | { kind: "abort" }
+      | { kind: "failure"; reason: CooldownReason; code: string }
+    > {
+      try {
+        const response = (await classify({
+          input,
+          model,
+          timeoutMs,
+          signal: ctx.signal,
+          getAuth: () => ctx.modelRegistry.getApiKeyAndHeaders(model as never),
+        })) as { text?: string };
+        const text = response?.text ?? "";
+        if (!text.trim()) return { kind: "failure", reason: "empty_response", code: "empty_response" };
+        const parsed = parseClassifierResponse(text);
+        return parsed.ok
+          ? { kind: "ok", classification: parsed.classification }
+          : { kind: "failure", reason: "invalid_protocol", code: parsed.code };
+      } catch (error) {
+        if (ctx.signal?.aborted || (error as { name?: string })?.name === "AbortError") {
+          return { kind: "abort" };
+        }
+        const reason = classifierFailureReason(error);
+        return { kind: "failure", reason, code: reason };
+      }
+    }
+
     async function classifyEligible(
       admission: Admission,
       prompt: string,
@@ -2296,12 +2354,8 @@ export function createModelRouterExtension(dependencies: RouterDependencies = {}
       requestId: string,
       ctx: ExtensionContext,
     ): Promise<Classification> {
-      const readiness = await ensureReadiness(ctx);
-      const classifierModel = readiness?.resolved.classifier;
-      if (!classifierModel || !admission.capsule) {
-        return { status: "failed", code: "classifier_unavailable" };
-      }
       const config = state.config as ResolvedRouterConfig;
+      if (!admission.capsule || !config.models) return { status: "failed", code: "classifier_unavailable" };
       const input = buildClassifierInput({
         requestId,
         prompt,
@@ -2310,29 +2364,51 @@ export function createModelRouterExtension(dependencies: RouterDependencies = {}
         imageMetadata: (images ?? []).map((image) => ({ mimeType: image.mimeType })),
         maxInputChars: config.classification.maxInputChars,
       });
-      if (!classify) return { status: "failed", code: "classifier_unavailable" };
       const startedAt = now().getTime();
-      let text: string;
-      try {
-        const response = (await classify({
+      const deadline = startedAt + config.classification.totalTimeoutMs;
+      const failureCodes: string[] = [];
+      let attemptCount = 0;
+      let pool = [...config.models.classifier];
+      let selected: ModelIdentityConfig | undefined;
+      while (pool.length > 0) {
+        const remaining = deadline - now().getTime();
+        if (remaining <= 0) break;
+        const selection = await selectModelCandidate({ role: "classifier", pool, registry: ctx.modelRegistry, health });
+        failureCodes.push(...selection.failureCodes);
+        if (selection.status !== "ready") break;
+        selected = selection.identity;
+        pool = pool.slice(pool.findIndex((item) => modelKey(item) === modelKey(selected)) + 1);
+        attemptCount += 1;
+        const result = await runClassifierAttempt(
+          selection.model,
           input,
-          model: classifierModel,
-          timeoutMs: config.classification.timeoutMs,
-          signal: ctx.signal,
-          getAuth: () => ctx.modelRegistry.getApiKeyAndHeaders(classifierModel as never),
-        })) as { text?: string };
-        text = response?.text ?? "";
-      } catch {
-        return { status: "failed", code: "classifier_error" };
+          Math.min(config.classification.timeoutMs, remaining),
+          ctx,
+        );
+        if (result.kind === "abort") {
+          return { status: "failed", code: "user_aborted", classifierModel: modelKey(selected) ?? undefined, attemptCount, failureCodes };
+        }
+        if (result.kind === "ok") {
+          return { status: "ok", classification: result.classification, latencyMs: now().getTime() - startedAt,
+            classifierModel: modelKey(selected) ?? undefined, attemptCount, failureCodes };
+        }
+        health.markFailure("classifier", selected, result.reason);
+        failureCodes.push(result.code);
       }
-      const parsed = parseClassifierResponse(text);
-      if (!parsed.ok) return { status: "failed", code: parsed.code };
-      return { status: "ok", classification: parsed.classification, latencyMs: now().getTime() - startedAt };
+      return { status: "failed", code: deadline <= now().getTime() ? "classifier_budget_exhausted" : "classifier_unavailable",
+        classifierModel: modelKey(selected) ?? undefined, attemptCount, failureCodes };
     }
 
     function auditClassification(classification: Classification | undefined): AuditRecordInput["classification"] {
       if (!classification) return { status: "skipped" };
-      if (classification.status === "failed") return { status: "failed", code: classification.code };
+      const metadata = {
+        ...(classification.classifierModel ? { classifierModel: classification.classifierModel } : {}),
+        ...(classification.attemptCount === undefined ? {} : { attemptCount: classification.attemptCount }),
+        ...(classification.failureCodes ? { failureCodes: classification.failureCodes } : {}),
+      };
+      if (classification.status === "failed") {
+        return { status: "failed", code: classification.code, ...metadata };
+      }
       const c = classification.classification;
       return {
         status: "ok",
@@ -2341,6 +2417,7 @@ export function createModelRouterExtension(dependencies: RouterDependencies = {}
         riskFlags: c.riskFlags,
         reasonCode: c.reasonCode,
         latencyMs: classification.latencyMs ?? null,
+        ...metadata,
       };
     }
 

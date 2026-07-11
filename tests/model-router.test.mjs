@@ -1440,6 +1440,155 @@ test("classifier combination: weak only with high confidence and no flags", asyn
 });
 
 // ---------------------------------------------------------------------------
+// Model pool failover Gate 4: bounded classifier fallback
+// ---------------------------------------------------------------------------
+
+const CLASSIFIER_POOL = [
+  { provider: "test", id: "classifier-1", supportsImages: false },
+  { provider: "test", id: "classifier-2", supportsImages: false },
+  { provider: "test", id: "classifier-3", supportsImages: false },
+];
+const WEAK_POOL = [
+  { provider: "test", id: "weak-1", supportsImages: true },
+];
+const POOL_REGISTRY_MODELS = [
+  ...CLASSIFIER_POOL.map((identity) => fakeModel(identity.provider, identity.id)),
+  fakeModel("test", "weak-1", ["text", "image"]),
+];
+
+function poolConfig(overrides = {}) {
+  return baseConfig({
+    mode: "shadow",
+    models: { classifier: CLASSIFIER_POOL, weak: WEAK_POOL },
+    ...overrides,
+  });
+}
+
+async function setupClassifierPool(options = {}) {
+  const harness = createHarness({
+    registryModels: options.registryModels ?? POOL_REGISTRY_MODELS,
+    auth: options.auth,
+    cwd: REPO,
+  });
+  await setupExtension(harness, {
+    files: { [CONFIG_PATH]: JSON.stringify(poolConfig(options.configOverrides)) },
+    classify: options.classify,
+    now: options.now,
+  });
+  return harness;
+}
+
+test("classifier fallback: technical and protocol failures cool first candidate then use next", async () => {
+  const cases = [
+    { name: "provider", first: async () => { throw new Error("provider body secret"); }, reason: "provider_error" },
+    { name: "empty", first: async () => ({ text: "" }), reason: "empty_response" },
+    { name: "protocol", first: async () => ({ text: "not-json secret" }), reason: "invalid_protocol" },
+  ];
+  for (const scenario of cases) {
+    const calls = [];
+    const harness = await setupClassifierPool({
+      classify: async (request) => {
+        calls.push(`${request.model.provider}/${request.model.id}`);
+        if (request.model.id === "classifier-1") return scenario.first();
+        return { text: GOOD_CLASSIFIER_JSON };
+      },
+    });
+    await emitStart(harness);
+    assert.deepEqual(calls, ["test/classifier-1", "test/classifier-2"], scenario.name);
+    const health = JSON.parse(harness.fs.files.get(HEALTH_PATH));
+    assert.equal(health.entries.find((entry) => entry.id === "classifier-1").reason, scenario.reason);
+    assert.ok(!JSON.stringify(health).includes("secret"));
+  }
+});
+
+test("classifier fallback: resolution not-found/auth failures continue without calling failed identity", async () => {
+  const calls = [];
+  const registryModels = POOL_REGISTRY_MODELS.filter((model) => model.id !== "classifier-1");
+  const harness = await setupClassifierPool({
+    registryModels,
+    classify: async (request) => {
+      calls.push(request.model.id);
+      return { text: GOOD_CLASSIFIER_JSON };
+    },
+  });
+  await emitStart(harness);
+  assert.deepEqual(calls, ["classifier-2"]);
+
+  const authCalls = [];
+  const authHarness = await setupClassifierPool({
+    auth: { "test/classifier-1": false },
+    classify: async (request) => {
+      authCalls.push(request.model.id);
+      return { text: GOOD_CLASSIFIER_JSON };
+    },
+  });
+  await emitStart(authHarness);
+  assert.deepEqual(authCalls, ["classifier-2"]);
+});
+
+test("classifier fallback: valid strong, low-confidence, and risk result stop without voting or cooldown", async () => {
+  const validResults = [
+    { route: "strong" },
+    { confidence: 0.2 },
+    { riskFlags: ["sensitive"] },
+  ];
+  for (const overrides of validResults) {
+    const calls = [];
+    const harness = await setupClassifierPool({
+      classify: async (request) => {
+        calls.push(request.model.id);
+        return { text: classifierText(overrides) };
+      },
+    });
+    await emitStart(harness);
+    assert.deepEqual(calls, ["classifier-1"]);
+    assert.equal(harness.fs.files.has(HEALTH_PATH), false);
+  }
+});
+
+test("classifier fallback: user abort stops chain without cooldown", async () => {
+  const controller = new AbortController();
+  controller.abort();
+  const calls = [];
+  const harness = await setupClassifierPool({
+    classify: async (request) => {
+      calls.push(request.model.id);
+      const error = new Error("user cancelled secret");
+      error.name = "AbortError";
+      throw error;
+    },
+  });
+  harness.ctx.signal = controller.signal;
+  await emitStart(harness);
+  assert.deepEqual(calls, ["classifier-1"]);
+  assert.equal(harness.fs.files.has(HEALTH_PATH), false);
+});
+
+test("classifier budget: each attempt receives remaining total timeout and unattempted candidate is not cooled", async () => {
+  let time = Date.parse("2026-07-11T12:00:00.000Z");
+  const calls = [];
+  const harness = await setupClassifierPool({
+    configOverrides: {
+      classification: { timeoutMs: 8000, totalTimeoutMs: 10000 },
+    },
+    now: () => new Date(time),
+    classify: async (request) => {
+      calls.push({ id: request.model.id, timeoutMs: request.timeoutMs });
+      time += 7000;
+      throw Object.assign(new Error("timeout"), { name: "TimeoutError" });
+    },
+  });
+  await emitStart(harness);
+  assert.deepEqual(calls, [
+    { id: "classifier-1", timeoutMs: 8000 },
+    { id: "classifier-2", timeoutMs: 3000 },
+  ]);
+  const health = JSON.parse(harness.fs.files.get(HEALTH_PATH));
+  assert.deepEqual(health.entries.map((entry) => entry.id).sort(), ["classifier-1", "classifier-2"]);
+  assert.ok(!health.entries.some((entry) => entry.id === "classifier-3"));
+});
+
+// ---------------------------------------------------------------------------
 // Gate 7: phase 1 shadow orchestration and JSONL audit
 // ---------------------------------------------------------------------------
 

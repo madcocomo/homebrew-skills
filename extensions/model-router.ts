@@ -149,13 +149,14 @@ export interface ResolvedRouterConfig {
   version: 1;
   mode: RouterMode;
   models?: {
-    classifier: ModelIdentityConfig;
-    weak: ModelIdentityConfig;
+    classifier: ModelIdentityConfig[];
+    weak: ModelIdentityConfig[];
   };
   classification: {
     ruleProfile: "conservative-v1";
     minWeakConfidence: number;
     timeoutMs: number;
+    totalTimeoutMs: number;
     maxInputChars: number;
   };
   limits: {
@@ -268,6 +269,28 @@ function parseModelIdentity(
   return { provider, id, supportsImages };
 }
 
+function parseModelPool(
+  value: unknown,
+  path: string,
+  errors: string[],
+): ModelIdentityConfig[] | undefined {
+  const rawItems = Array.isArray(value) ? value : [value];
+  if (rawItems.length === 0) {
+    errors.push(`${path}: must be a non-empty model identity or array`);
+    return undefined;
+  }
+  const items = rawItems
+    .map((item, index) => parseModelIdentity(item, Array.isArray(value) ? `${path}[${index}]` : path, errors))
+    .filter((item): item is ModelIdentityConfig => item !== undefined);
+  const seen = new Set<string>();
+  for (const item of items) {
+    const key = `${item.provider}/${item.id}`;
+    if (seen.has(key)) errors.push(`${path}: duplicate model identity ${key}`);
+    seen.add(key);
+  }
+  return items.length === rawItems.length ? items : undefined;
+}
+
 function expandLogDirectory(directory: string, env: Record<string, string | undefined>): string {
   if (directory === "~" || directory.startsWith("~/")) {
     const home = env.HOME;
@@ -312,12 +335,12 @@ export function parseModelRouterConfig(
   if (record.models !== undefined) {
     if (checkExactKeys(record.models, "config.models", ["classifier", "weak"], errors)) {
       const modelsRecord = record.models as Record<string, unknown>;
-      const roles: Record<string, ModelIdentityConfig | undefined> = {};
+      const roles: Record<string, ModelIdentityConfig[] | undefined> = {};
       for (const role of ["classifier", "weak"]) {
         if (modelsRecord[role] === undefined) {
           errors.push(`config.models.${role}: required`);
         } else {
-          roles[role] = parseModelIdentity(modelsRecord[role], `config.models.${role}`, errors);
+          roles[role] = parseModelPool(modelsRecord[role], `config.models.${role}`, errors);
         }
       }
       if (roles.classifier && roles.weak) {
@@ -333,6 +356,7 @@ export function parseModelRouterConfig(
     ruleProfile: "conservative-v1" as const,
     minWeakConfidence: 0.9,
     timeoutMs: 20_000,
+    totalTimeoutMs: 30_000,
     maxInputChars: 12_000,
   };
   if (record.classification !== undefined) {
@@ -341,7 +365,7 @@ export function parseModelRouterConfig(
       checkExactKeys(
         record.classification,
         path,
-        ["ruleProfile", "minWeakConfidence", "timeoutMs", "maxInputChars"],
+        ["ruleProfile", "minWeakConfidence", "timeoutMs", "totalTimeoutMs", "maxInputChars"],
         errors,
       )
     ) {
@@ -356,6 +380,15 @@ export function parseModelRouterConfig(
       if (c.timeoutMs !== undefined) {
         const v = checkIntInRange(c.timeoutMs, `${path}.timeoutMs`, BOUNDS.classificationTimeoutMs, errors);
         if (v !== undefined) classification.timeoutMs = v;
+      }
+      if (c.totalTimeoutMs !== undefined) {
+        const v = checkIntInRange(
+          c.totalTimeoutMs,
+          `${path}.totalTimeoutMs`,
+          BOUNDS.classificationTimeoutMs,
+          errors,
+        );
+        if (v !== undefined) classification.totalTimeoutMs = v;
       }
       if (c.maxInputChars !== undefined) {
         const v = checkIntInRange(c.maxInputChars, `${path}.maxInputChars`, BOUNDS.maxInputChars, errors);
@@ -1363,7 +1396,7 @@ export function createProductionSubPiRunner(
   const warn = deps?.warn ?? (() => {});
 
   return async (invocation: SubPiInvocation, signal?: AbortSignal): Promise<SubPiResult> => {
-    const weakModel = config.models?.weak;
+    const weakModel = config.models?.weak[0];
     if (!weakModel) {
       return { status: "error", errorCode: "no_weak_model", errorMessage: "no weak model configured" };
     }
@@ -1471,7 +1504,7 @@ export function registerSubPiTool(
       const admission = evaluateAdmission({
         prompt: promptForAdmission,
         imageCount: 0,
-        weakSupportsImages: config.models?.weak?.supportsImages ?? false,
+        weakSupportsImages: config.models?.weak[0]?.supportsImages ?? false,
         maxInputChars: config.classification.maxInputChars,
         capsule: { status: "complete", capsule },
       });
@@ -1490,7 +1523,7 @@ export function registerSubPiTool(
         }
 
         // 5. Verify weak model configured
-        const weakModel = config.models?.weak;
+        const weakModel = config.models?.weak[0];
         if (!weakModel) {
           reject("no_weak_model", "no weak model configured");
         }
@@ -1552,8 +1585,8 @@ export async function resolveConfiguredModels(
   if (!config.models) {
     throw new Error(`cannot resolve models: config has no models section (mode=${mode})`);
   }
-  const classifier = await resolveRole(config.models.classifier, registry);
-  const weak = await resolveRole(config.models.weak, registry);
+  const classifier = await resolveRole(config.models.classifier[0], registry);
+  const weak = await resolveRole(config.models.weak[0], registry);
 
   const reasons: string[] = [];
   if (classifier.readiness.status !== "ok") reasons.push("classifier_unavailable");
@@ -1953,7 +1986,7 @@ export function createModelRouterExtension(dependencies: RouterDependencies = {}
     function targetIdentity(route: RouteDecision["route"]): ModelIdentity | null {
       const models = state.config?.models;
       if (!models) return null;
-      if (route === "weak") return { provider: models.weak.provider, id: models.weak.id };
+      if (route === "weak") return { provider: models.weak[0].provider, id: models.weak[0].id };
       // "strong" verdict means do not intervene — target is null
       return null;
     }
@@ -2648,8 +2681,8 @@ function reportStatus(state: RuntimeState, configPath: string, ctx: ExtensionCom
   ];
   const models = state.config?.models;
   if (models) {
-    lines.push(`classifier model: ${models.classifier.provider}/${models.classifier.id}`);
-    lines.push(`weak model: ${models.weak.provider}/${models.weak.id}`);
+    lines.push(`classifier model: ${models.classifier[0].provider}/${models.classifier[0].id}`);
+    lines.push(`weak model: ${models.weak[0].provider}/${models.weak[0].id}`);
   }
   if (state.config) {
     lines.push(`log directory: ${state.config.logging.directory}`);

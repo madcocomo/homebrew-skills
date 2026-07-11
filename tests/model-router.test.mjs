@@ -473,6 +473,7 @@ test("config: accepts complete off/shadow/active configs and applies documented 
     assert.equal(result.config.classification.ruleProfile, "conservative-v1");
     assert.equal(result.config.classification.minWeakConfidence, 0.9);
     assert.equal(result.config.classification.timeoutMs, 20000);
+    assert.equal(result.config.classification.totalTimeoutMs, 30000);
     assert.equal(result.config.classification.maxInputChars, 12000);
     assert.equal(result.config.limits.maxWeakContinuationTurns, 4);
     assert.equal(result.config.limits.maxNoProgressTurns, 2);
@@ -482,6 +483,57 @@ test("config: accepts complete off/shadow/active configs and applies documented 
     assert.equal(result.config.subPi.enabled, false);
     assert.equal(result.config.subPi.maxConcurrent, 1);
     assert.equal(result.config.subPi.timeoutMs, 1800000);
+  }
+});
+
+test("config: normalizes singleton identities and preserves ordered model pools", async () => {
+  const singleton = await parseConfigWith(baseConfig({ mode: "active" }));
+  assert.equal(singleton.kind, "valid");
+  assert.deepEqual(singleton.config.models.classifier, [baseConfig().models.classifier]);
+  assert.deepEqual(singleton.config.models.weak, [baseConfig().models.weak]);
+
+  const classifier = [
+    { provider: "nvidia-free", id: "z-ai/glm-5.2", supportsImages: false },
+    { provider: "deepseek", id: "deepseek-v4-flash", supportsImages: false },
+  ];
+  const weak = [
+    { provider: "google", id: "gemini-3.5-flash", supportsImages: true },
+    { provider: "opencode", id: "mimo-v2.5-free", supportsImages: true },
+  ];
+  const pooled = await parseConfigWith(baseConfig({ mode: "active", models: { classifier, weak } }));
+  assert.equal(pooled.kind, "valid", JSON.stringify(pooled.errors ?? []));
+  assert.deepEqual(pooled.config.models.classifier, classifier);
+  assert.deepEqual(pooled.config.models.weak, weak);
+});
+
+test("config: rejects empty, duplicate, and malformed model pool entries", async () => {
+  const classifier = baseConfig().models.classifier;
+  const weak = baseConfig().models.weak;
+  const cases = [
+    { classifier: [], weak: [weak] },
+    { classifier: [classifier], weak: [] },
+    { classifier: [classifier, { ...classifier }], weak: [weak] },
+    { classifier: [classifier], weak: [weak, { ...weak }] },
+    { classifier: [classifier, null], weak: [weak] },
+    { classifier: [classifier], weak: [{ provider: "p", id: "m" }] },
+  ];
+  for (const [index, models] of cases.entries()) {
+    const result = await parseConfigWith(baseConfig({ mode: "active", models }));
+    assert.equal(result.kind, "invalid", `case ${index} should be invalid`);
+  }
+});
+
+test("config: classification totalTimeoutMs defaults independently and validates its range", async () => {
+  const explicit = await parseConfigWith(baseConfig({
+    classification: { timeoutMs: 5000, totalTimeoutMs: 25000 },
+  }));
+  assert.equal(explicit.kind, "valid", JSON.stringify(explicit.errors ?? []));
+  assert.equal(explicit.config.classification.timeoutMs, 5000);
+  assert.equal(explicit.config.classification.totalTimeoutMs, 25000);
+
+  for (const totalTimeoutMs of [0, 2.5, 600001]) {
+    const result = await parseConfigWith(baseConfig({ classification: { totalTimeoutMs } }));
+    assert.equal(result.kind, "invalid", `totalTimeoutMs=${totalTimeoutMs} should be invalid`);
   }
 });
 

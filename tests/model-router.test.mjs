@@ -2126,6 +2126,143 @@ test("active initial: setModel failure does not abort", async () => {
   assert.equal(harness.abortCalls, 0, "weak setModel failure must not abort");
 });
 
+test("active initial: weak fallback switches to later candidate and records actual target", async () => {
+  const weak = [
+    { provider: "test", id: "weak-1", supportsImages: true },
+    { provider: "test", id: "weak-2", supportsImages: true },
+    { provider: "test", id: "weak-3", supportsImages: false },
+  ];
+  const registryModels = [
+    fakeModel("test", "classifier-1"),
+    fakeModel("test", "weak-1", ["text", "image"]),
+    fakeModel("test", "weak-2", ["text", "image"]),
+    fakeModel("test", "weak-3"),
+  ];
+  const harness = createHarness({
+    registryModels,
+    cwd: REPO,
+    setModelResults: { "test/weak-1": false },
+  });
+  await setupExtension(harness, {
+    files: { [CONFIG_PATH]: JSON.stringify(baseConfig({
+      mode: "active",
+      models: { classifier: [CLASSIFIER_POOL[0]], weak },
+    })) },
+    classify: async () => ({ text: GOOD_CLASSIFIER_JSON }),
+  });
+  const results = await emitStart(harness);
+  assert.deepEqual(harness.setModelCalls.map((call) => call.id), ["weak-1", "weak-2"]);
+  assert.equal(harness.ctx.model.id, "weak-2");
+  assert.ok(results.some((entry) => entry?.message?.customType === "model-router-capsule"));
+  assert.equal(readLogRecords(harness).at(-1).targetModel, "test/weak-2");
+  const health = JSON.parse(harness.fs.files.get(HEALTH_PATH));
+  assert.equal(health.entries.find((entry) => entry.id === "weak-1").reason, "set_model_failed");
+});
+
+test("active image request: skips text-only weak without cooldown and uses image-capable fallback", async () => {
+  const weak = [
+    { provider: "test", id: "text-weak", supportsImages: false },
+    { provider: "test", id: "image-weak", supportsImages: true },
+  ];
+  const harness = createHarness({
+    registryModels: [
+      fakeModel("test", "classifier-1"),
+      fakeModel("test", "text-weak"),
+      fakeModel("test", "image-weak", ["text", "image"]),
+    ],
+    cwd: REPO,
+  });
+  await setupExtension(harness, {
+    files: { [CONFIG_PATH]: JSON.stringify(baseConfig({
+      mode: "active",
+      models: { classifier: [CLASSIFIER_POOL[0]], weak },
+    })) },
+    classify: async () => ({ text: GOOD_CLASSIFIER_JSON }),
+  });
+  await emitStart(harness, FULL_TASK_PROMPT, [{ mimeType: "image/png" }]);
+  assert.deepEqual(harness.setModelCalls.map((call) => call.id), ["image-weak"]);
+  assert.equal(harness.fs.files.has(HEALTH_PATH), false);
+});
+
+test("active image request: no image-capable weak keeps exact user model without cooldown", async () => {
+  const userModel = fakeModel("user", "image-model", ["text", "image"]);
+  const weak = [
+    { provider: "test", id: "text-1", supportsImages: false },
+    { provider: "test", id: "text-2", supportsImages: false },
+  ];
+  const harness = createHarness({
+    registryModels: [fakeModel("test", "classifier-1"), fakeModel("test", "text-1"), fakeModel("test", "text-2")],
+    currentModel: userModel,
+    cwd: REPO,
+  });
+  await setupExtension(harness, {
+    files: { [CONFIG_PATH]: JSON.stringify(baseConfig({ mode: "active", models: { classifier: [CLASSIFIER_POOL[0]], weak } })) },
+    classify: async () => ({ text: GOOD_CLASSIFIER_JSON }),
+  });
+  await emitStart(harness, FULL_TASK_PROMPT, [{ mimeType: "image/png" }]);
+  assert.equal(harness.setModelCalls.length, 0);
+  assert.strictEqual(harness.ctx.model, userModel);
+  assert.equal(harness.fs.files.has(HEALTH_PATH), false);
+});
+
+test("weak model error: cools actual weak, restores exact lease model, next request uses fallback", async () => {
+  const returnModel = fakeModel("user", "return-after-error", ["text", "image"]);
+  const weak = [
+    { provider: "test", id: "weak-1", supportsImages: true },
+    { provider: "test", id: "weak-2", supportsImages: true },
+  ];
+  const harness = createHarness({
+    registryModels: [
+      fakeModel("test", "classifier-1"),
+      fakeModel("test", "weak-1", ["text", "image"]),
+      fakeModel("test", "weak-2", ["text", "image"]),
+    ],
+    currentModel: returnModel,
+    cwd: REPO,
+  });
+  await setupExtension(harness, {
+    files: { [CONFIG_PATH]: JSON.stringify(baseConfig({ mode: "active", models: { classifier: [CLASSIFIER_POOL[0]], weak } })) },
+    classify: async () => ({ text: GOOD_CLASSIFIER_JSON }),
+  });
+  await emitStart(harness);
+  await harness.emit("turn_end", {
+    type: "turn_end", turnIndex: 0,
+    message: { role: "assistant", provider: "test", model: "weak-1", stopReason: "error", content: [] },
+    toolResults: [],
+  });
+  assert.strictEqual(harness.ctx.model, returnModel);
+  let health = JSON.parse(harness.fs.files.get(HEALTH_PATH));
+  assert.equal(health.entries.find((entry) => entry.id === "weak-1").reason, "weak_model_error");
+
+  await emitStart(harness);
+  assert.equal(harness.ctx.model.id, "weak-2");
+  assert.deepEqual(harness.setModelCalls.map((call) => call.id), ["weak-1", "return-after-error", "weak-2"]);
+  health = JSON.parse(harness.fs.files.get(HEALTH_PATH));
+  assert.equal(health.entries.filter((entry) => entry.id === "weak-1").length, 1);
+});
+
+test("weak abort and quality signal release lease without model cooldown", async () => {
+  const returnModel = fakeModel("user", "return-no-cooldown", ["text", "image"]);
+  const harness = await setupActive({ currentModel: returnModel });
+  await emitStart(harness);
+  await harness.emit("turn_end", {
+    type: "turn_end", turnIndex: 0,
+    message: { role: "assistant", provider: "opencode", model: "mimo-v2.5-free", stopReason: "aborted", content: [] },
+    toolResults: [],
+  });
+  assert.strictEqual(harness.ctx.model, returnModel);
+  assert.equal(harness.fs.files.has(HEALTH_PATH), false);
+
+  await emitStart(harness);
+  await emitToolPair(harness, {
+    id: "quality", toolName: "bash", input: { command: "node --test tests/date.test.mjs" },
+    isError: true, details: { exitCode: 1 },
+  });
+  await emitTurnEnd(harness, { toolResultIds: ["quality"] });
+  assert.strictEqual(harness.ctx.model, returnModel);
+  assert.equal(harness.fs.files.has(HEALTH_PATH), false);
+});
+
 test("active initial: weak route injects capsule message", async () => {
   const harness = await setupActive();
   const results = await harness.emit("before_agent_start", {

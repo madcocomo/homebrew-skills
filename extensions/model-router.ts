@@ -1196,7 +1196,8 @@ export type CandidateFailureCode =
   | "not_found"
   | "auth_missing"
   | "image_capability_mismatch"
-  | "image_not_supported";
+  | "image_not_supported"
+  | "set_model_failed";
 
 export type CandidateSelection =
   | {
@@ -2297,12 +2298,41 @@ export function createModelRouterExtension(dependencies: RouterDependencies = {}
       return ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : null;
     }
 
-    function targetIdentity(route: RouteDecision["route"]): ModelIdentity | null {
+    function targetIdentity(
+      route: RouteDecision["route"],
+      selection: CandidateSelection | undefined,
+    ): ModelIdentity | null {
+      return route === "weak" && selection?.status === "ready"
+        ? { provider: selection.identity.provider, id: selection.identity.id }
+        : null;
+    }
+
+    async function switchWeakModel(
+      ctx: ExtensionContext,
+      requireImages: boolean,
+    ): Promise<CandidateSelection> {
       const models = state.config?.models;
-      if (!models) return null;
-      if (route === "weak") return { provider: models.weak[0].provider, id: models.weak[0].id };
-      // "strong" verdict means do not intervene — target is null
-      return null;
+      if (!models) return { status: "exhausted", attemptCount: 0, failureCodes: [] };
+      let pool = [...models.weak];
+      const failureCodes: CandidateFailureCode[] = [];
+      while (pool.length > 0) {
+        const selection = await selectModelCandidate({
+          role: "weak", pool, registry: ctx.modelRegistry, health, requireImages,
+        });
+        failureCodes.push(...selection.failureCodes);
+        if (selection.status !== "ready") return { ...selection, failureCodes };
+        pool = pool.slice(pool.findIndex((item) => modelKey(item) === modelKey(selection.identity)) + 1);
+        let switched = false;
+        try {
+          switched = (await pi.setModel(selection.model as RuntimeModel)) !== false;
+        } catch {
+          switched = false;
+        }
+        if (switched) return { ...selection, failureCodes };
+        health.markFailure("weak", selection.identity, "set_model_failed");
+        failureCodes.push("set_model_failed");
+      }
+      return { status: "exhausted", attemptCount: 0, failureCodes };
     }
 
     function toolSummaryOf(observations: ToolObservation[]): ToolSummary {
@@ -2443,6 +2473,16 @@ export function createModelRouterExtension(dependencies: RouterDependencies = {}
       }
       captureActivationModel(ctx);
       const readiness = await ensureReadiness(ctx);
+      const requireImages = (event.images?.length ?? 0) > 0;
+      const weakSelection = requireImages
+        ? await selectModelCandidate({
+            role: "weak",
+            pool: state.config.models.weak,
+            registry: ctx.modelRegistry,
+            health,
+            requireImages: true,
+          })
+        : readiness?.selections.weak;
       const requestId = randomId();
       const capsuleResult = buildTaskCapsule(event.prompt, {
         cwd: ctx.cwd,
@@ -2453,7 +2493,7 @@ export function createModelRouterExtension(dependencies: RouterDependencies = {}
       const admission = evaluateAdmission({
         prompt: event.prompt,
         imageCount: event.images?.length ?? 0,
-        weakSupportsImages: readiness?.roles.weak.supportsImages ?? false,
+        weakSupportsImages: requireImages ? weakSelection?.status === "ready" : true,
         maxInputChars: state.config.classification.maxInputChars,
         capsule: capsuleResult,
       });
@@ -2474,7 +2514,7 @@ export function createModelRouterExtension(dependencies: RouterDependencies = {}
         classification: auditClassification(classification),
         decision,
         capsule: admission.capsule,
-        targetModel: targetIdentity(decision.route),
+        targetModel: targetIdentity(decision.route, weakSelection),
         weakContinuationCount: 0,
         noProgressCount: 0,
         operationCounts: new Map(),
@@ -2486,11 +2526,14 @@ export function createModelRouterExtension(dependencies: RouterDependencies = {}
       let hookResult: BeforeAgentStartEventResult | undefined;
       // === Gate 9: Active mode model switching ===
       if (state.runtimeMode === "active") {
-        const target = state.request.targetModel;
-        if (target && decision.route === "weak" && ctx.model) {
+        if (decision.route === "weak" && ctx.model) {
           const leaseReturnModel = ctx.model;
-          const switched = await applySetModel(target, ctx);
-          if (switched) {
+          const switched = await switchWeakModel(ctx, requireImages);
+          if (switched.status === "ready") {
+            state.request.targetModel = {
+              provider: switched.identity.provider,
+              id: switched.identity.id,
+            };
             state.request.routeState = "weak-lease";
             state.request.leaseReturnModel = leaseReturnModel;
             if (admission.capsule) {
@@ -2504,13 +2547,10 @@ export function createModelRouterExtension(dependencies: RouterDependencies = {}
               };
             }
           } else {
-            // Weak setModel failed — no fallback, clear routeState and let Pi continue
-            warn("model-router: weak setModel failed, continuing with current model");
-            state.request.routeState = "undecided";
+            state.request.targetModel = null;
+            warn("model-router: weak pool unavailable, continuing with current model");
           }
-        } else if (decision.route === "strong") {
-          // Strong verdict means do not intervene — keep current model
-        } else {
+        } else if (decision.route === "reject") {
           state.effectiveState = "error";
           warn("model-router: request rejected by deterministic routing rules");
           ctx.abort();
@@ -2588,9 +2628,14 @@ export function createModelRouterExtension(dependencies: RouterDependencies = {}
         .map((result) => request.observations.get(result.toolCallId))
         .filter((observation): observation is ToolObservation => observation !== undefined);
 
-      const weakResponseFailed = message.stopReason === "error" || message.stopReason === "aborted";
+      const weakResponseFailed = message.stopReason === "error";
+      const weakResponseAborted = message.stopReason === "aborted";
       if (weakResponseFailed && request.routeState === "weak-lease") {
+        if (request.targetModel) health.markFailure("weak", request.targetModel, "weak_model_error");
         request.signals.add("weak_model_failure");
+        await releaseWeakLease();
+      } else if (weakResponseAborted && request.routeState === "weak-lease") {
+        request.signals.add("weak_model_aborted");
         await releaseWeakLease();
       }
 

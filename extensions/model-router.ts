@@ -33,6 +33,7 @@ export interface RouterFs {
   mkdir(path: string, options?: { recursive?: boolean; mode?: number }): void;
   appendFile(path: string, data: string, options?: { mode?: number }): void;
   writeFile(path: string, data: string, options?: { mode?: number }): void;
+  rename(from: string, to: string): void;
   exists(path: string): boolean;
   realpath(path: string): string;
   remove?(path: string): void;
@@ -64,6 +65,7 @@ function createNodeFs(): RouterFs {
     writeFile: (path, data, options) => {
       nodeFs.writeFileSync(path, data, { mode: options?.mode });
     },
+    rename: (from, to) => nodeFs.renameSync(from, to),
     exists: (path) => nodeFs.existsSync(path),
     realpath: (path) => nodeFs.realpathSync(path),
     remove: (path) => nodeFs.rmSync(path, { recursive: true, force: true }),
@@ -497,6 +499,170 @@ export function loadConfig(
     return { kind: "invalid", path, errors: parsed.errors };
   }
   return { kind: "valid", path, config: parsed.config };
+}
+
+// ---------------------------------------------------------------------------
+// Persistent role/model cooldown health store
+// ---------------------------------------------------------------------------
+
+export type ModelRole = "classifier" | "weak";
+export const COOLDOWN_REASONS = [
+  "not_found",
+  "auth_missing",
+  "image_capability_mismatch",
+  "provider_error",
+  "timeout",
+  "empty_response",
+  "invalid_protocol",
+  "set_model_failed",
+  "weak_model_error",
+  "child_model_error",
+] as const;
+export type CooldownReason = typeof COOLDOWN_REASONS[number];
+
+export interface ModelHealthEntry {
+  role: ModelRole;
+  provider: string;
+  id: string;
+  failedAt: number;
+  retryAfter: number;
+  reason: CooldownReason;
+}
+
+export interface ModelHealthStore {
+  refresh(): void;
+  getCooling(role: ModelRole, identity: Pick<ModelIdentityConfig, "provider" | "id">): ModelHealthEntry | undefined;
+  markFailure(
+    role: ModelRole,
+    identity: Pick<ModelIdentityConfig, "provider" | "id">,
+    reason: CooldownReason,
+  ): ModelHealthEntry;
+  listCooling(): ModelHealthEntry[];
+}
+
+const MODEL_COOLDOWN_MS = 1_800_000;
+
+export function getModelHealthPath(agentDir: string): string {
+  return join(agentDir, "model-router-health.json");
+}
+
+function healthKey(entry: Pick<ModelHealthEntry, "role" | "provider" | "id">): string {
+  return `${entry.role}/${entry.provider}/${entry.id}`;
+}
+
+function parseHealthFile(text: string): ModelHealthEntry[] | undefined {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+  const errors: string[] = [];
+  if (!checkExactKeys(raw, "health", ["version", "entries"], errors)) return undefined;
+  const record = raw as Record<string, unknown>;
+  if (record.version !== 1 || !Array.isArray(record.entries)) return undefined;
+  const entries: ModelHealthEntry[] = [];
+  for (const value of record.entries) {
+    if (!checkExactKeys(value, "health.entries[]", ["role", "provider", "id", "failedAt", "retryAfter", "reason"], errors)) {
+      return undefined;
+    }
+    const item = value as Record<string, unknown>;
+    if (item.role !== "classifier" && item.role !== "weak") return undefined;
+    if (typeof item.provider !== "string" || !item.provider || typeof item.id !== "string" || !item.id) return undefined;
+    if (!Number.isSafeInteger(item.failedAt) || !Number.isSafeInteger(item.retryAfter)) return undefined;
+    if (!COOLDOWN_REASONS.includes(item.reason as CooldownReason)) return undefined;
+    entries.push(item as unknown as ModelHealthEntry);
+  }
+  return errors.length === 0 ? entries : undefined;
+}
+
+function mergeHealthEntries(
+  target: Map<string, ModelHealthEntry>,
+  entries: ModelHealthEntry[],
+  nowMs: number,
+): void {
+  for (const entry of entries) {
+    if (entry.retryAfter <= nowMs) continue;
+    const key = healthKey(entry);
+    const current = target.get(key);
+    if (!current || entry.retryAfter > current.retryAfter) target.set(key, { ...entry });
+  }
+}
+
+export function createModelHealthStore(options: {
+  fs: RouterFs;
+  agentDir: string;
+  now: () => Date;
+  randomId: () => string;
+  warn: (message: string) => void;
+}): ModelHealthStore {
+  const path = getModelHealthPath(options.agentDir);
+  const memory = new Map<string, ModelHealthEntry>();
+  let warned = false;
+  const warnOnce = (): void => {
+    if (warned) return;
+    warned = true;
+    options.warn("model-router: health store unavailable; in-memory cooldown remains active");
+  };
+  const readDisk = (): ModelHealthEntry[] => {
+    try {
+      const entries = parseHealthFile(options.fs.readTextFile(path));
+      if (!entries) {
+        warnOnce();
+        return [];
+      }
+      return entries;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") warnOnce();
+      return [];
+    }
+  };
+  const prune = (nowMs: number): void => {
+    for (const [key, entry] of memory) {
+      if (entry.retryAfter <= nowMs) memory.delete(key);
+    }
+  };
+  const refresh = (): void => {
+    const nowMs = options.now().getTime();
+    prune(nowMs);
+    mergeHealthEntries(memory, readDisk(), nowMs);
+  };
+  const persist = (): void => {
+    const nowMs = options.now().getTime();
+    prune(nowMs);
+    const tempPath = `${path}.tmp-${options.randomId()}`;
+    try {
+      options.fs.mkdir(dirname(path), { recursive: true, mode: 0o700 });
+      const entries = [...memory.values()].sort((a, b) => healthKey(a).localeCompare(healthKey(b)));
+      options.fs.writeFile(tempPath, `${JSON.stringify({ version: 1, entries }, null, 2)}\n`, { mode: 0o600 });
+      options.fs.rename(tempPath, path);
+    } catch {
+      warnOnce();
+      try { options.fs.remove?.(tempPath); } catch { /* best effort */ }
+    }
+  };
+  return {
+    refresh,
+    getCooling(role, identity) {
+      refresh();
+      return memory.get(healthKey({ role, ...identity }));
+    },
+    markFailure(role, identity, reason) {
+      if (!COOLDOWN_REASONS.includes(reason)) throw new Error("invalid cooldown reason");
+      refresh();
+      const failedAt = options.now().getTime();
+      const entry = { role, ...identity, failedAt, retryAfter: failedAt + MODEL_COOLDOWN_MS, reason };
+      const key = healthKey(entry);
+      const current = memory.get(key);
+      if (!current || entry.retryAfter >= current.retryAfter) memory.set(key, entry);
+      persist();
+      return memory.get(key) as ModelHealthEntry;
+    },
+    listCooling() {
+      refresh();
+      return [...memory.values()].map((entry) => ({ ...entry }));
+    },
+  };
 }
 
 // ---------------------------------------------------------------------------

@@ -106,13 +106,16 @@ function createFakeFs(initial = {}) {
   const dirs = new Set();
   const modes = new Map();
   const removals = [];
+  const renames = [];
   return {
     files,
     dirs,
     modes,
     removals,
-    failures: { mkdir: null, append: null },
+    renames,
+    failures: { read: null, mkdir: null, append: null, write: null, rename: null },
     readTextFile(path) {
+      if (this.failures.read) throw this.failures.read;
       if (!files.has(path)) {
         const err = new Error(`ENOENT: no such file: ${path}`);
         err.code = "ENOENT";
@@ -131,8 +134,20 @@ function createFakeFs(initial = {}) {
       if (options.mode !== undefined && !modes.has(path)) modes.set(path, options.mode);
     },
     writeFile(path, data, options = {}) {
+      if (this.failures.write) throw this.failures.write;
       files.set(path, data);
       if (options.mode !== undefined) modes.set(path, options.mode);
+    },
+    rename(from, to) {
+      if (this.failures.rename) throw this.failures.rename;
+      if (!files.has(from)) throw new Error(`missing rename source: ${from}`);
+      files.set(to, files.get(from));
+      files.delete(from);
+      if (modes.has(from)) {
+        modes.set(to, modes.get(from));
+        modes.delete(from);
+      }
+      renames.push({ from, to });
     },
     exists(path) {
       return files.has(path) || dirs.has(path);
@@ -664,6 +679,112 @@ test("config: invalid config means off/error with zero classifier/logger/setMode
   const text = harness.notifications.map((n) => n.message).join("\n");
   assert.ok(/error/i.test(text), "status should surface config error state");
   assert.ok(!text.includes("{broken"), "status must not echo raw config JSON");
+});
+
+// ---------------------------------------------------------------------------
+// Model pool failover Gate 2: persistent redacted cooldown health store
+// ---------------------------------------------------------------------------
+
+const HEALTH_PATH = `${AGENT_DIR}/model-router-health.json`;
+const COOLDOWN_MS = 1_800_000;
+
+function healthEntry(overrides = {}) {
+  return {
+    role: "weak",
+    provider: "google",
+    id: "gemini-3.5-flash",
+    failedAt: Date.parse("2026-07-11T12:00:00.000Z"),
+    retryAfter: Date.parse("2026-07-11T12:30:00.000Z"),
+    reason: "provider_error",
+    ...overrides,
+  };
+}
+
+async function makeHealthStore(options = {}) {
+  const module = await loadModelRouterModule();
+  const fs = options.fs ?? createFakeFs();
+  const warnings = options.warnings ?? [];
+  const store = module.createModelHealthStore({
+    fs,
+    agentDir: AGENT_DIR,
+    now: options.now ?? (() => new Date("2026-07-11T12:00:00.000Z")),
+    randomId: options.randomId ?? (() => "health-temp"),
+    warn: (message) => warnings.push(message),
+  });
+  return { module, store, fs, warnings };
+}
+
+test("health cooldown: role and identity isolation with exact 30-minute expiry boundary", async () => {
+  let time = Date.parse("2026-07-11T12:00:00.000Z");
+  const { store } = await makeHealthStore({ now: () => new Date(time) });
+  store.markFailure("weak", { provider: "google", id: "gemini-3.5-flash" }, "provider_error");
+
+  assert.equal(store.getCooling("classifier", { provider: "google", id: "gemini-3.5-flash" }), undefined);
+  assert.equal(store.getCooling("weak", { provider: "google", id: "other" }), undefined);
+  time += COOLDOWN_MS - 1;
+  assert.equal(store.getCooling("weak", { provider: "google", id: "gemini-3.5-flash" }).retryAfter, time + 1);
+  time += 1;
+  assert.equal(store.getCooling("weak", { provider: "google", id: "gemini-3.5-flash" }), undefined);
+});
+
+test("health store: merges disk and memory by later retryAfter and preserves concurrent records", async () => {
+  const diskEntry = healthEntry({ role: "classifier", provider: "deepseek", id: "a" });
+  const fs = createFakeFs({
+    [HEALTH_PATH]: JSON.stringify({ version: 1, entries: [diskEntry] }),
+  });
+  const { store } = await makeHealthStore({ fs });
+  store.markFailure("weak", { provider: "google", id: "b" }, "set_model_failed");
+  let persisted = JSON.parse(fs.files.get(HEALTH_PATH));
+  assert.deepEqual(
+    persisted.entries.map((entry) => `${entry.role}/${entry.provider}/${entry.id}`).sort(),
+    ["classifier/deepseek/a", "weak/google/b"],
+  );
+
+  const later = healthEntry({
+    role: "weak",
+    provider: "google",
+    id: "b",
+    retryAfter: Date.parse("2026-07-11T13:00:00.000Z"),
+  });
+  fs.files.set(HEALTH_PATH, JSON.stringify({ version: 1, entries: [diskEntry, later] }));
+  assert.equal(store.getCooling("weak", { provider: "google", id: "b" }).retryAfter, later.retryAfter);
+});
+
+test("health store: prunes expired entries and atomically writes redacted mode-0600 content", async () => {
+  const expired = healthEntry({ retryAfter: Date.parse("2026-07-11T11:59:59.999Z") });
+  const secret = "SECRET prompt response Authorization Bearer";
+  const fs = createFakeFs({
+    [HEALTH_PATH]: JSON.stringify({ version: 1, entries: [expired], ignored: secret }),
+  });
+  const { store } = await makeHealthStore({ fs, randomId: () => "atomic" });
+  store.markFailure("classifier", { provider: "nvidia-free", id: "z-ai/glm-5.2" }, "timeout");
+
+  const raw = fs.files.get(HEALTH_PATH);
+  const persisted = JSON.parse(raw);
+  assert.equal(persisted.version, 1);
+  assert.equal(persisted.entries.length, 1);
+  assert.deepEqual(Object.keys(persisted.entries[0]).sort(), ["failedAt", "id", "provider", "reason", "retryAfter", "role"].sort());
+  assert.ok(!raw.includes(secret));
+  assert.equal(fs.modes.get(HEALTH_PATH), 0o600);
+  assert.equal(fs.renames.length, 1);
+  assert.match(fs.renames[0].from, /model-router-health\.json\.tmp-atomic$/);
+  assert.equal(fs.renames[0].to, HEALTH_PATH);
+});
+
+test("health store failure: warning is generic and rate-limited while memory cooldown survives", async () => {
+  const secret = "SECRET-EXCEPTION-BODY";
+  const fs = createFakeFs({ [HEALTH_PATH]: `{broken ${secret}` });
+  const warnings = [];
+  const { store } = await makeHealthStore({ fs, warnings });
+  store.refresh();
+  store.refresh();
+  assert.equal(warnings.length, 1);
+  assert.ok(!warnings[0].includes(secret));
+
+  fs.failures.write = new Error(secret);
+  store.markFailure("weak", { provider: "opencode", id: "mimo-v2.5-free" }, "weak_model_error");
+  assert.equal(store.getCooling("weak", { provider: "opencode", id: "mimo-v2.5-free" }).reason, "weak_model_error");
+  assert.equal(warnings.length, 1, "read/write failures share one rate-limited generic warning");
 });
 
 // ---------------------------------------------------------------------------

@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
 import { copyFile, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -9,14 +10,32 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 const repoRoot = fileURLToPath(new URL("..", import.meta.url));
 const sourcePath = join(repoRoot, "extensions", "plan-runner.ts");
 
+const PREFERRED_PACKAGE = "@earendil-works/pi-coding-agent";
+const LEGACY_PACKAGE = "@mariozechner/pi-coding-agent";
+
+function resolvePackageRoot() {
+  if (process.env.PI_CODING_AGENT_PACKAGE_ROOT) return process.env.PI_CODING_AGENT_PACKAGE_ROOT;
+  const npmRoot = execFileSync("npm", ["root", "-g"], { encoding: "utf8" }).trim();
+  const preferredGlobal = join(npmRoot, ...PREFERRED_PACKAGE.split("/"));
+  if (existsSync(preferredGlobal)) return preferredGlobal;
+  const nodejsDir = dirname(dirname(dirname(process.execPath)));
+  const preferredSibling = join(nodejsDir, ".npm", "lib", "node_modules", ...PREFERRED_PACKAGE.split("/"));
+  if (existsSync(preferredSibling)) return preferredSibling;
+  const legacyGlobal = join(npmRoot, ...LEGACY_PACKAGE.split("/"));
+  if (existsSync(legacyGlobal)) return legacyGlobal;
+  throw new Error("pi-coding-agent package root not found");
+}
+
 let modulePromise;
 
 async function loadPlanRunnerModule() {
   if (!modulePromise) {
     modulePromise = (async () => {
-      const npmRoot = execFileSync("npm", ["root", "-g"], { encoding: "utf8" }).trim();
-      const piPackageRoot = join(npmRoot, "@mariozechner", "pi-coding-agent");
-      const jitiEntry = join(piPackageRoot, "node_modules", "@mariozechner", "jiti", "lib", "jiti.mjs");
+      const piPackageRoot = resolvePackageRoot();
+      let jitiEntry = join(piPackageRoot, "node_modules", "jiti", "lib", "jiti.mjs");
+      if (!existsSync(jitiEntry)) {
+        jitiEntry = join(piPackageRoot, "node_modules", "@mariozechner", "jiti", "lib", "jiti.mjs");
+      }
       const tempDir = await mkdtemp(join(tmpdir(), "plan-runner-test-"));
 
       await mkdir(join(tempDir, "node_modules", "@mariozechner"), { recursive: true });

@@ -2209,7 +2209,9 @@ interface RuntimeState {
   config?: ResolvedRouterConfig;
   configuredMode: RouterMode;
   runtimeMode: RouterMode;
-  effectiveState: "off" | "off-error" | "shadow-ready" | "active-ready" | "restore-error" | "error";
+  effectiveState: "off" | "off-error" | "shadow-ready" | "active-ready" | "suspended" | "restore-error" | "error";
+  suspendedReason?: string;
+  suspendedUntil?: number;
   activationModel?: ModelIdentity;
   handlersRegistered: boolean;
   readiness?: Awaited<ReturnType<typeof resolveConfiguredModels>>;
@@ -2459,6 +2461,37 @@ export function createModelRouterExtension(dependencies: RouterDependencies = {}
       }
     }
 
+    function earliestHealthRetry(): number | undefined {
+      const retries = health.listCooling().map((entry) => entry.retryAfter);
+      return retries.length > 0 ? Math.min(...retries) : undefined;
+    }
+
+    async function suspendRouter(reason: string): Promise<void> {
+      await releaseWeakLease();
+      state.effectiveState = "suspended";
+      state.suspendedReason = reason;
+      state.suspendedUntil = earliestHealthRetry();
+    }
+
+    async function ensureRouterAvailable(ctx: ExtensionContext): Promise<boolean> {
+      if (state.effectiveState === "suspended" && state.suspendedUntil !== undefined &&
+        now().getTime() < state.suspendedUntil) {
+        return false;
+      }
+      const readiness = await ensureReadiness(ctx);
+      if (!readiness?.activeReady) {
+        const reason = readiness?.reasons[0] ?? "required_pool_exhausted";
+        await suspendRouter(reason);
+        return false;
+      }
+      if (state.effectiveState === "suspended") {
+        state.effectiveState = state.runtimeMode === "active" ? "active-ready" : "shadow-ready";
+        state.suspendedReason = undefined;
+        state.suspendedUntil = undefined;
+      }
+      return true;
+    }
+
     // -----------------------------------------------------------------------
     // Event handlers
     // -----------------------------------------------------------------------
@@ -2471,8 +2504,13 @@ export function createModelRouterExtension(dependencies: RouterDependencies = {}
       if (state.runtimeMode === "active" && state.request?.routeState === "weak-lease") {
         await releaseWeakLease();
       }
+      state.request = undefined;
       captureActivationModel(ctx);
-      const readiness = await ensureReadiness(ctx);
+      if (!(await ensureRouterAvailable(ctx))) {
+        updateStatusBar(ctx);
+        return;
+      }
+      const readiness = state.readiness;
       const requireImages = (event.images?.length ?? 0) > 0;
       const weakSelection = requireImages
         ? await selectModelCandidate({
@@ -2525,7 +2563,11 @@ export function createModelRouterExtension(dependencies: RouterDependencies = {}
       };
       let hookResult: BeforeAgentStartEventResult | undefined;
       // === Gate 9: Active mode model switching ===
-      if (state.runtimeMode === "active") {
+      if (classification?.status === "failed" && classification.code !== "user_aborted") {
+        const refreshed = await ensureReadiness(ctx);
+        if (!refreshed?.activeReady) await suspendRouter("classifier_pool_exhausted");
+      }
+      if (state.runtimeMode === "active" && state.effectiveState !== "suspended") {
         if (decision.route === "weak" && ctx.model) {
           const leaseReturnModel = ctx.model;
           const switched = await switchWeakModel(ctx, requireImages);
@@ -2548,7 +2590,8 @@ export function createModelRouterExtension(dependencies: RouterDependencies = {}
             }
           } else {
             state.request.targetModel = null;
-            warn("model-router: weak pool unavailable, continuing with current model");
+            await suspendRouter("weak_pool_exhausted");
+            warn("model-router: weak pool unavailable, router suspended");
           }
         } else if (decision.route === "reject") {
           state.effectiveState = "error";
@@ -2579,7 +2622,7 @@ export function createModelRouterExtension(dependencies: RouterDependencies = {}
 
     function onToolCall(event: { toolCallId: string; toolName: string; input: Record<string, unknown> }): void {
       const request = state.request;
-      if (state.runtimeMode === "off" || !request) return;
+      if (state.runtimeMode === "off" || state.effectiveState === "suspended" || !request) return;
       const observation: ToolObservation = {
         toolCallId: event.toolCallId,
         toolName: event.toolName,
@@ -2601,7 +2644,7 @@ export function createModelRouterExtension(dependencies: RouterDependencies = {}
       details?: unknown;
     }): void {
       const request = state.request;
-      if (state.runtimeMode === "off" || !request) return;
+      if (state.runtimeMode === "off" || state.effectiveState === "suspended" || !request) return;
       const observation = request.observations.get(event.toolCallId);
       if (!observation) return;
       observation.isError = event.isError;
@@ -2618,7 +2661,7 @@ export function createModelRouterExtension(dependencies: RouterDependencies = {}
       ctx: ExtensionContext,
     ): Promise<void> {
       const request = state.request;
-      if (state.runtimeMode === "off" || !request || !state.config) return;
+      if (state.runtimeMode === "off" || state.effectiveState === "suspended" || !request || !state.config) return;
       const message = event.message as { provider?: string; model?: string; usage?: unknown; stopReason?: string };
       const actual = message.provider && message.model
         ? { provider: message.provider, id: message.model }
@@ -2724,7 +2767,7 @@ export function createModelRouterExtension(dependencies: RouterDependencies = {}
 
     async function onAgentEnd(ctx: ExtensionContext): Promise<void> {
       const request = state.request;
-      if (state.runtimeMode === "off" || !request || request.decision.route !== "weak") return;
+      if (state.runtimeMode === "off" || state.effectiveState === "suspended" || !request || request.decision.route !== "weak") return;
       const missingArtifacts = request.capsule
         ? checkExpectedArtifacts(request.capsule, (path) => fs.exists(path)).missing.length > 0
         : false;
@@ -2874,6 +2917,8 @@ export function createModelRouterExtension(dependencies: RouterDependencies = {}
       }
       state.runtimeMode = "off";
       state.effectiveState = restoreFailed ? "restore-error" : "off";
+      state.suspendedReason = undefined;
+      state.suspendedUntil = undefined;
       state.request = undefined;
       state.lastActualModel = undefined;
       state.readiness = undefined;
@@ -2908,14 +2953,14 @@ export function createModelRouterExtension(dependencies: RouterDependencies = {}
       await captureAndRegisterHandlers();
       captureActivationModel(ctx);
       state.runtimeMode = "shadow";
-      state.effectiveState = "shadow-ready";
-      // Append state entry
+      if (state.effectiveState !== "suspended") state.effectiveState = "shadow-ready";
+      const available = await ensureRouterAvailable(ctx);
       pi.appendEntry("model-router-state", {
         version: 1,
         mode: "shadow",
         activationModel: state.activationModel ? { provider: state.activationModel.provider, id: state.activationModel.id } : null,
       });
-      notify(ctx, "model-router: shadow mode enabled", "info");
+      notify(ctx, available ? "model-router: shadow mode enabled" : "model-router: shadow intent preserved; router suspended", available ? "info" : "warning");
     }
 
     async function cmdActive(ctx: ExtensionCommandContext): Promise<void> {
@@ -2923,31 +2968,25 @@ export function createModelRouterExtension(dependencies: RouterDependencies = {}
         notify(ctx, "model-router: no configured models; cannot enable active mode", "error");
         return;
       }
-      const readiness = await ensureReadiness(ctx);
-      if (!readiness?.activeReady) {
-        const reasons = readiness?.reasons ?? ["classifier or weak unavailable"];
-        notify(ctx, `model-router: cannot enable active - ${reasons.join("; ")}`, "error");
-        return;
-      }
-      if (state.runtimeMode === "active") {
+      if (state.runtimeMode === "active" && state.effectiveState === "active-ready") {
         notify(ctx, "model-router: already active", "info");
         return;
       }
-      if (state.runtimeMode !== "off" && state.activationModel) {
+      if (state.runtimeMode !== "off" && state.runtimeMode !== "active" && state.activationModel) {
         await ctx.waitForIdle();
         await applySetModel(state.activationModel, ctx);
       }
       await captureAndRegisterHandlers();
       captureActivationModel(ctx);
       state.runtimeMode = "active";
-      state.effectiveState = "active-ready";
-      // Append state entry
+      if (state.effectiveState !== "suspended") state.effectiveState = "active-ready";
+      const available = await ensureRouterAvailable(ctx);
       pi.appendEntry("model-router-state", {
         version: 1,
         mode: "active",
         activationModel: state.activationModel ? { provider: state.activationModel.provider, id: state.activationModel.id } : null,
       });
-      notify(ctx, "model-router: active mode enabled", "info");
+      notify(ctx, available ? "model-router: active mode enabled" : "model-router: active intent preserved; router suspended (models unavailable)", available ? "info" : "warning");
     }
 
     // -----------------------------------------------------------------------
@@ -3063,6 +3102,12 @@ function extractExitCode(
 
 function statusBarText(state: RuntimeState): string | undefined {
   if (state.runtimeMode === "off") return undefined;
+  if (state.effectiveState === "suspended") {
+    const retry = state.suspendedUntil === undefined
+      ? "unknown"
+      : `${Math.max(0, Math.ceil((state.suspendedUntil - Date.now()) / 60_000))}m`;
+    return `routing:suspended · retry=${retry}`;
+  }
   const request = state.request;
   if (state.runtimeMode === "shadow") {
     const target = request?.decision.route ?? "-";
@@ -3098,6 +3143,12 @@ function reportStatus(state: RuntimeState, configPath: string, ctx: ExtensionCom
   if (state.config) {
     lines.push(`log directory: ${state.config.logging.directory}`);
     lines.push(`sub-pi: ${state.config.subPi.enabled ? "enabled" : "disabled"}`);
+  }
+  if (state.effectiveState === "suspended") {
+    lines.push(`suspended reason: ${state.suspendedReason ?? "required_pool_exhausted"}`);
+    if (state.suspendedUntil !== undefined) {
+      lines.push(`suspended retry after: ${new Date(state.suspendedUntil).toISOString()}`);
+    }
   }
   if (state.activationModel) {
     lines.push(`activation model: ${state.activationModel.provider}/${state.activationModel.id}`);

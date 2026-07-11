@@ -2343,6 +2343,134 @@ test("active: actual model mismatch releases the weak lease to its return model"
 });
 
 // ---------------------------------------------------------------------------
+// Model pool failover Gate 6: suspended state and request-boundary recovery
+// ---------------------------------------------------------------------------
+
+async function setupSuspensionHarness(options = {}) {
+  const registryModels = options.registryModels ?? [
+    fakeModel("test", "weak-1", ["text", "image"]),
+  ];
+  const harness = createHarness({
+    registryModels,
+    cwd: REPO,
+    setModelResults: options.setModelResults,
+  });
+  let time = options.time ?? Date.parse("2026-07-11T12:00:00.000Z");
+  await setupExtension(harness, {
+    files: { [CONFIG_PATH]: JSON.stringify(baseConfig({
+      mode: options.mode ?? "active",
+      models: {
+        classifier: [{ provider: "test", id: "classifier-1", supportsImages: false }],
+        weak: [{ provider: "test", id: "weak-1", supportsImages: true }],
+      },
+    })) },
+    classify: async (request) => {
+      harness.classifierCalls.push({ request });
+      return { text: GOOD_CLASSIFIER_JSON };
+    },
+    now: () => new Date(time),
+  });
+  return { harness, registryModels, getTime: () => time, setTime: (value) => { time = value; } };
+}
+
+async function routingStatusText(harness) {
+  harness.notifications.length = 0;
+  await harness.runCommand("routing", "status");
+  return harness.notifications.map((entry) => entry.message).join("\n");
+}
+
+test("suspended: exhausted classifier pool disables ordinary routing side effects", async () => {
+  const { harness } = await setupSuspensionHarness();
+  const first = await emitStart(harness);
+  assert.equal(harness.classifierCalls.length, 0);
+  assert.equal(harness.setModelCalls.length, 0);
+  assert.ok(first.every((entry) => !entry?.message));
+  assert.match(await routingStatusText(harness), /suspended/i);
+
+  const findCount = harness.registryFindCalls.length;
+  const second = await emitStart(harness);
+  assert.equal(harness.registryFindCalls.length, findCount, "before retry no registry lookup occurs");
+  assert.equal(harness.classifierCalls.length, 0);
+  assert.equal(harness.setModelCalls.length, 0);
+  assert.ok(second.every((entry) => !entry?.message));
+});
+
+test("suspended: active weak setModel exhaustion preserves user model and suspends router", async () => {
+  const userModel = fakeModel("user", "selected", ["text", "image"]);
+  const weak = [
+    { provider: "test", id: "weak-1", supportsImages: true },
+    { provider: "test", id: "weak-2", supportsImages: true },
+  ];
+  const harness = createHarness({
+    registryModels: [
+      fakeModel("test", "classifier-1"),
+      fakeModel("test", "weak-1", ["text", "image"]),
+      fakeModel("test", "weak-2", ["text", "image"]),
+    ],
+    currentModel: userModel,
+    setModelResults: { "test/weak-1": false, "test/weak-2": false },
+    cwd: REPO,
+  });
+  await setupExtension(harness, {
+    files: { [CONFIG_PATH]: JSON.stringify(baseConfig({
+      mode: "active",
+      models: { classifier: [CLASSIFIER_POOL[0]], weak },
+    })) },
+    classify: async () => ({ text: GOOD_CLASSIFIER_JSON }),
+  });
+  await emitStart(harness);
+  assert.strictEqual(harness.ctx.model, userModel);
+  assert.deepEqual(harness.setModelCalls.map((call) => call.id), ["weak-1", "weak-2"]);
+  assert.match(await routingStatusText(harness), /suspended/i);
+});
+
+test("automatic recovery: exact cooldown expiry restores active intent and processes triggering request", async () => {
+  const setup = await setupSuspensionHarness();
+  const { harness, registryModels } = setup;
+  await emitStart(harness);
+  const findCount = harness.registryFindCalls.length;
+  registryModels.push(fakeModel("test", "classifier-1"));
+
+  setup.setTime(setup.getTime() + COOLDOWN_MS - 1);
+  await emitStart(harness);
+  assert.equal(harness.registryFindCalls.length, findCount);
+  assert.equal(harness.classifierCalls.length, 0);
+
+  setup.setTime(setup.getTime() + 1);
+  const result = await emitStart(harness);
+  assert.equal(harness.classifierCalls.length, 1);
+  assert.equal(harness.ctx.model.id, "weak-1");
+  assert.ok(result.some((entry) => entry?.message?.customType === "model-router-capsule"));
+  assert.doesNotMatch(await routingStatusText(harness), /state: suspended/i);
+});
+
+test("automatic recovery: failed expiry retry re-cools candidate and remains suspended", async () => {
+  const setup = await setupSuspensionHarness();
+  const { harness } = setup;
+  await emitStart(harness);
+  setup.setTime(setup.getTime() + COOLDOWN_MS);
+  await emitStart(harness);
+  assert.match(await routingStatusText(harness), /suspended/i);
+  const health = JSON.parse(harness.fs.files.get(HEALTH_PATH));
+  assert.equal(health.entries[0].retryAfter, setup.getTime() + COOLDOWN_MS);
+});
+
+test("/routing active preserves requested intent as suspended and off does not clear cooldown", async () => {
+  const { harness } = await setupSuspensionHarness({ mode: "shadow" });
+  await emitStart(harness);
+  await harness.runCommand("routing", "active");
+  let status = await routingStatusText(harness);
+  assert.match(status, /effective mode: active/i);
+  assert.match(status, /state: suspended/i);
+  const healthBefore = harness.fs.files.get(HEALTH_PATH);
+
+  await harness.runCommand("routing", "off");
+  status = await routingStatusText(harness);
+  assert.match(status, /effective mode: off/i);
+  assert.equal(harness.fs.files.get(HEALTH_PATH), healthBefore);
+});
+
+// ---------------------------------------------------------------------------
 // Gate 10: /routing commands, activation snapshot, status bar, restore
 // ---------------------------------------------------------------------------
 

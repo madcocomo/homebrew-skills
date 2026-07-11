@@ -892,6 +892,118 @@ test("model resolver: shadow resolves fixed models and records readiness without
   assert.equal(readiness.roles.weak.status, "ok");
 });
 
+test("candidate pool: selects first ready exact identity in order after cooling technical failures", async () => {
+  const module = await loadModelRouterModule();
+  const harness = createHarness({
+    registryModels: [
+      fakeModel("p", "second"),
+      fakeModel("p", "third"),
+    ],
+  });
+  const { store } = await makeHealthStore();
+  const selection = await module.selectModelCandidate({
+    role: "classifier",
+    pool: [
+      { provider: "p", id: "missing", supportsImages: false },
+      { provider: "p", id: "second", supportsImages: false },
+      { provider: "p", id: "third", supportsImages: false },
+    ],
+    registry: harness.registry,
+    health: store,
+  });
+  assert.equal(selection.status, "ready");
+  assert.equal(selection.identity.id, "second");
+  assert.deepEqual(harness.registryFindCalls.map((call) => call.id), ["missing", "second"]);
+  assert.equal(store.getCooling("classifier", { provider: "p", id: "missing" }).reason, "not_found");
+});
+
+test("candidate pool: skips cooling identity without registry/auth calls", async () => {
+  const module = await loadModelRouterModule();
+  const harness = createHarness({ registryModels: [fakeModel("p", "first"), fakeModel("p", "second")] });
+  const { store } = await makeHealthStore();
+  store.markFailure("weak", { provider: "p", id: "first" }, "provider_error");
+  const selection = await module.selectModelCandidate({
+    role: "weak",
+    pool: [
+      { provider: "p", id: "first", supportsImages: false },
+      { provider: "p", id: "second", supportsImages: false },
+    ],
+    registry: harness.registry,
+    health: store,
+  });
+  assert.equal(selection.identity.id, "second");
+  assert.deepEqual(harness.registryFindCalls.map((call) => call.id), ["second"]);
+  assert.deepEqual(harness.authCalls.map((call) => call.key), ["p/second"]);
+});
+
+test("candidate pool: auth and declaration mismatch cool then continue with fixed failure codes", async () => {
+  const module = await loadModelRouterModule();
+  const harness = createHarness({
+    registryModels: [
+      fakeModel("p", "no-auth"),
+      fakeModel("p", "bad-image", ["text"]),
+      fakeModel("p", "ready", ["text", "image"]),
+    ],
+    auth: { "p/no-auth": false },
+  });
+  const { store } = await makeHealthStore();
+  const selection = await module.selectModelCandidate({
+    role: "weak",
+    pool: [
+      { provider: "p", id: "no-auth", supportsImages: false },
+      { provider: "p", id: "bad-image", supportsImages: true },
+      { provider: "p", id: "ready", supportsImages: true },
+    ],
+    registry: harness.registry,
+    health: store,
+  });
+  assert.equal(selection.identity.id, "ready");
+  assert.deepEqual(selection.failureCodes, ["auth_missing", "image_capability_mismatch"]);
+  assert.equal(store.getCooling("weak", { provider: "p", id: "no-auth" }).reason, "auth_missing");
+  assert.equal(store.getCooling("weak", { provider: "p", id: "bad-image" }).reason, "image_capability_mismatch");
+});
+
+test("candidate pool: image request skips declared text-only weak without cooling", async () => {
+  const module = await loadModelRouterModule();
+  const harness = createHarness({
+    registryModels: [fakeModel("p", "text-only"), fakeModel("p", "image", ["text", "image"])],
+  });
+  const { store } = await makeHealthStore();
+  const selection = await module.selectModelCandidate({
+    role: "weak",
+    pool: [
+      { provider: "p", id: "text-only", supportsImages: false },
+      { provider: "p", id: "image", supportsImages: true },
+    ],
+    registry: harness.registry,
+    health: store,
+    requireImages: true,
+  });
+  assert.equal(selection.identity.id, "image");
+  assert.deepEqual(harness.registryFindCalls.map((call) => call.id), ["image"]);
+  assert.equal(store.getCooling("weak", { provider: "p", id: "text-only" }), undefined);
+});
+
+test("candidate pool: exhausted result exposes earliest retry and redacted fixed codes", async () => {
+  const module = await loadModelRouterModule();
+  const harness = createHarness({ registryModels: [] });
+  const { store } = await makeHealthStore();
+  store.markFailure("classifier", { provider: "p", id: "cooling" }, "timeout");
+  const selection = await module.selectModelCandidate({
+    role: "classifier",
+    pool: [
+      { provider: "p", id: "cooling", supportsImages: false },
+      { provider: "p", id: "missing", supportsImages: false },
+    ],
+    registry: harness.registry,
+    health: store,
+  });
+  assert.equal(selection.status, "exhausted");
+  assert.equal(selection.nextRetryAfter, Date.parse("2026-07-11T12:30:00.000Z"));
+  assert.deepEqual(selection.failureCodes, ["cooling_down", "not_found"]);
+  assert.ok(!JSON.stringify(selection).includes("unit-test-fake"));
+});
+
 // ---------------------------------------------------------------------------
 // Gate 4: task capsule construction, strict validation, path constraints
 // ---------------------------------------------------------------------------

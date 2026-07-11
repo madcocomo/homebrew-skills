@@ -1156,7 +1156,7 @@ export function combineRouteDecision(
 // Fixed model resolution and auth (design section 7.4 / gate 3)
 // ---------------------------------------------------------------------------
 
-export type RoleStatus = "ok" | "not_found" | "auth_missing" | "image_capability_mismatch";
+export type RoleStatus = "ok" | "cooling_down" | "not_found" | "auth_missing" | "image_capability_mismatch";
 
 export interface RoleReadiness {
   provider: string;
@@ -1176,6 +1176,98 @@ export interface ModelsReadiness {
 interface RegistryLike {
   find(provider: string, id: string): { input?: string[] } | undefined;
   getApiKeyAndHeaders(model: unknown): Promise<{ ok: boolean }>;
+}
+
+export type CandidateFailureCode =
+  | "cooling_down"
+  | "not_found"
+  | "auth_missing"
+  | "image_capability_mismatch"
+  | "image_not_supported";
+
+export type CandidateSelection =
+  | {
+      status: "ready";
+      identity: ModelIdentityConfig;
+      model: unknown;
+      supportsImages: boolean;
+      attemptCount: number;
+      failureCodes: CandidateFailureCode[];
+    }
+  | {
+      status: "exhausted" | "no_compatible_candidate";
+      attemptCount: number;
+      failureCodes: CandidateFailureCode[];
+      nextRetryAfter?: number;
+    };
+
+export async function selectModelCandidate(options: {
+  role: ModelRole;
+  pool: ModelIdentityConfig[];
+  registry: RegistryLike;
+  health: ModelHealthStore;
+  requireImages?: boolean;
+}): Promise<CandidateSelection> {
+  const failureCodes: CandidateFailureCode[] = [];
+  let attemptCount = 0;
+  let nextRetryAfter: number | undefined;
+  let capabilitySkipped = false;
+  for (const identity of options.pool) {
+    if (options.requireImages && !identity.supportsImages) {
+      capabilitySkipped = true;
+      failureCodes.push("image_not_supported");
+      continue;
+    }
+    const cooling = options.health.getCooling(options.role, identity);
+    if (cooling) {
+      failureCodes.push("cooling_down");
+      nextRetryAfter = Math.min(nextRetryAfter ?? cooling.retryAfter, cooling.retryAfter);
+      continue;
+    }
+    attemptCount += 1;
+    const model = options.registry.find(identity.provider, identity.id);
+    if (!model) {
+      failureCodes.push("not_found");
+      const entry = options.health.markFailure(options.role, identity, "not_found");
+      nextRetryAfter = Math.min(nextRetryAfter ?? entry.retryAfter, entry.retryAfter);
+      continue;
+    }
+    const registryImages = Array.isArray(model.input) && model.input.includes("image");
+    if (identity.supportsImages && !registryImages) {
+      failureCodes.push("image_capability_mismatch");
+      const entry = options.health.markFailure(options.role, identity, "image_capability_mismatch");
+      nextRetryAfter = Math.min(nextRetryAfter ?? entry.retryAfter, entry.retryAfter);
+      continue;
+    }
+    let authReady = false;
+    try {
+      authReady = (await options.registry.getApiKeyAndHeaders(model)).ok;
+    } catch {
+      authReady = false;
+    }
+    if (!authReady) {
+      failureCodes.push("auth_missing");
+      const entry = options.health.markFailure(options.role, identity, "auth_missing");
+      nextRetryAfter = Math.min(nextRetryAfter ?? entry.retryAfter, entry.retryAfter);
+      continue;
+    }
+    return {
+      status: "ready",
+      identity: { ...identity },
+      model,
+      supportsImages: identity.supportsImages && registryImages,
+      attemptCount,
+      failureCodes,
+    };
+  }
+  return {
+    status: capabilitySkipped && attemptCount === 0 && nextRetryAfter === undefined
+      ? "no_compatible_candidate"
+      : "exhausted",
+    attemptCount,
+    failureCodes,
+    ...(nextRetryAfter === undefined ? {} : { nextRetryAfter }),
+  };
 }
 
 async function resolveRole(
@@ -1747,26 +1839,57 @@ export async function resolveConfiguredModels(
   config: ResolvedRouterConfig,
   registry: RegistryLike,
   mode: RouterMode,
-): Promise<ModelsReadiness & { resolved: { classifier?: unknown; weak?: unknown } }> {
+  health?: ModelHealthStore,
+): Promise<ModelsReadiness & {
+  resolved: { classifier?: unknown; weak?: unknown };
+  selections: { classifier: CandidateSelection; weak: CandidateSelection };
+}> {
   if (!config.models) {
     throw new Error(`cannot resolve models: config has no models section (mode=${mode})`);
   }
-  const classifier = await resolveRole(config.models.classifier[0], registry);
-  const weak = await resolveRole(config.models.weak[0], registry);
-
+  const transientHealth: ModelHealthStore = health ?? {
+    refresh() {},
+    getCooling() { return undefined; },
+    markFailure(role, identity, reason) {
+      const failedAt = Date.now();
+      return { role, ...identity, reason, failedAt, retryAfter: failedAt + MODEL_COOLDOWN_MS };
+    },
+    listCooling() { return []; },
+  };
+  const classifier = await selectModelCandidate({
+    role: "classifier",
+    pool: config.models.classifier,
+    registry,
+    health: transientHealth,
+  });
+  const weak = await selectModelCandidate({
+    role: "weak",
+    pool: config.models.weak,
+    registry,
+    health: transientHealth,
+  });
+  const readiness = (selection: CandidateSelection, fallback: ModelIdentityConfig): RoleReadiness => {
+    if (selection.status === "ready") {
+      return { ...selection.identity, status: "ok", supportsImages: selection.supportsImages };
+    }
+    const status = selection.failureCodes.find((code) => code !== "cooling_down" && code !== "image_not_supported")
+      ?? "cooling_down";
+    return { provider: fallback.provider, id: fallback.id, status: status as RoleStatus, supportsImages: false };
+  };
+  const classifierReadiness = readiness(classifier, config.models.classifier[0]);
+  const weakReadiness = readiness(weak, config.models.weak[0]);
   const reasons: string[] = [];
-  if (classifier.readiness.status !== "ok") reasons.push("classifier_unavailable");
-  if (weak.readiness.status !== "ok") reasons.push("weak_unavailable");
-
-  const activeReady = classifier.readiness.status === "ok" && weak.readiness.status === "ok";
+  if (classifier.status !== "ready") reasons.push("classifier_unavailable");
+  if (weak.status !== "ready") reasons.push("weak_unavailable");
   return {
-    roles: { classifier: classifier.readiness, weak: weak.readiness },
-    activeReady,
+    roles: { classifier: classifierReadiness, weak: weakReadiness },
+    activeReady: classifier.status === "ready" && weak.status === "ready",
     reasons,
     resolved: {
-      classifier: classifier.readiness.status === "ok" ? classifier.model : undefined,
-      weak: weak.readiness.status === "ok" ? weak.model : undefined,
+      classifier: classifier.status === "ready" ? classifier.model : undefined,
+      weak: weak.status === "ready" ? weak.model : undefined,
     },
+    selections: { classifier, weak },
   };
 }
 

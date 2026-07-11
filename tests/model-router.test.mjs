@@ -2709,6 +2709,99 @@ test("state persistence: manual model observation updates actual without overwri
 });
 
 // ---------------------------------------------------------------------------
+// Gate 12: shadow-review (shadow mode classification review)
+// ---------------------------------------------------------------------------
+
+function makeReviewConfig(mode, extraFields = {}) {
+  return JSON.stringify({ ...baseConfig({ mode }), ...extraFields });
+}
+
+function entry(overrides = {}) {
+  return JSON.stringify({
+    schemaVersion: 1, timestamp: "2026-07-11T11:00:00.000Z", mode: "shadow",
+    sessionId: "session-1", requestId: "req-001", turnIndex: 0, decisionKind: "initial",
+    admission: { verdict: "strong", reasonCodes: ["scope_ambiguous"] },
+    classification: { status: "skipped" },
+    targetModel: null, actualModel: "test/test-1", reasonCodes: ["scope_ambiguous"],
+    toolSummary: { count: 0, errors: 0, nonzeroExits: 0, operationHashes: [] },
+    ...overrides,
+  });
+}
+
+function setupForReview({ dir, mode, auditData }) {
+  const harness = createHarness({ registryModels: FIXED_MODELS, cwd: REPO });
+  return setupExtension(harness, {
+    files: { [CONFIG_PATH]: makeReviewConfig(mode, { logging: { directory: dir, maxReasonChars: 240 } }) },
+  }).then(() => {
+    const logFile = dir + "/2026-07-11.jsonl";
+    harness.fs.files.set(logFile, auditData.join("\n") + "\n");
+    harness.notifications.length = 0;
+    return harness;
+  });
+}
+
+test("/routing review shows no audit data when router is off", async () => {
+  const harness = await setupForReview({
+    dir: "/tmp/sr-off", mode: "off", auditData: [],
+  });
+  await harness.runCommand("routing", "review");
+  const text = harness.notifications.map((n) => n.message).join("\n");
+  assert.ok(text.includes("no audit data"), "off router: " + text);
+});
+
+test("/routing review shows summary with all strong entries", async () => {
+  const harness = await setupForReview({
+    dir: "/tmp/sr-strong", mode: "shadow",
+    auditData: [
+      entry({ requestId: "req-001" }),
+      entry({ requestId: "req-001", turnIndex: 1 }),
+      entry({ requestId: "req-002", admission: { verdict: "reject", reasonCodes: ["unsafe_input"] }, reasonCodes: ["unsafe_input"] }),
+    ],
+  });
+  await harness.runCommand("routing", "review");
+  const text = harness.notifications.map((n) => n.message).join("\n");
+  assert.ok(text.includes("Total records: 3"), "count: " + text);
+  assert.ok(/strong\s+2/.test(text), "strong: " + text);
+  assert.ok(/reject\s+1/.test(text), "reject: " + text);
+  assert.ok(/eligible\s+0/.test(text), "eligible: " + text);
+  assert.ok(text.includes("(would have switched to weak): 0"), "weak0: " + text);
+  assert.ok(text.includes("Assessment"), "has assessment");
+});
+
+test("/routing review shows weak-target entries with details", async () => {
+  const harness = await setupForReview({
+    dir: "/tmp/sr-weak", mode: "shadow",
+    auditData: [
+      entry({}),
+      entry({
+        requestId: "req-002",
+        admission: { verdict: "eligible", reasonCodes: ["in_scope"] },
+        classification: { status: "ok", route: "weak", confidence: 0.95, riskFlags: ["high_cost"], reasonCode: "localized_explicit_task", classifierModel: "test/classifier-1" },
+        targetModel: "test/weak-1", actualModel: null, reasonCodes: ["localized_explicit_task"],
+        selectedClassifier: "test/classifier-1", selectedWeak: "test/weak-1", fallbackCount: 0, failureCodes: [],
+      }),
+    ],
+  });
+  await harness.runCommand("routing", "review");
+  const text = harness.notifications.map((n) => n.message).join("\n");
+  assert.ok(text.includes("(would have switched to weak): 1"), "weak count: " + text);
+  assert.ok(text.includes("req-002"), "request id in output");
+  assert.ok(text.includes("0.95"), "confidence in output");
+  assert.ok(text.includes("test/weak-1"), "weak model in output: " + text);
+  assert.ok(text.includes("Assessment"), "has assessment");
+});
+
+test("/routing shadow-review alias works the same as review", async () => {
+  const harness = await setupForReview({
+    dir: "/tmp/sr-alias", mode: "shadow",
+    auditData: [entry({})],
+  });
+  await harness.runCommand("routing", "shadow-review");
+  const text = harness.notifications.map((n) => n.message).join("\n");
+  assert.ok(text.includes("Total records: 1"), "alias works: " + text);
+});
+
+// ---------------------------------------------------------------------------
 // Gate 12: shadow/active integration matrix
 // ---------------------------------------------------------------------------
 

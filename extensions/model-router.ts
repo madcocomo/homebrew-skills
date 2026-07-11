@@ -2931,7 +2931,11 @@ export function createModelRouterExtension(dependencies: RouterDependencies = {}
           await cmdActive(ctx);
           return;
         }
-        notify(ctx, `usage: /routing off|shadow|active|status`, "info");
+        if (arg === "shadow-review" || arg === "review") {
+          await cmdShadowReview(ctx);
+          return;
+        }
+        notify(ctx, `usage: /routing off|shadow|active|status|review`, "info");
       },
     });
 
@@ -3058,6 +3062,115 @@ export function createModelRouterExtension(dependencies: RouterDependencies = {}
         activationModel: state.activationModel ? { provider: state.activationModel.provider, id: state.activationModel.id } : null,
       });
       notify(ctx, available ? "model-router: active mode enabled" : "model-router: active intent preserved; router suspended (models unavailable)", available ? "info" : "warning");
+    }
+
+    async function cmdShadowReview(ctx: ExtensionCommandContext): Promise<void> {
+      const routerConfig = state.config;
+      if (!routerConfig || state.runtimeMode === "off") {
+        notify(ctx, "model-router: no audit data (router is off)", "info");
+        return;
+      }
+      const directory = routerConfig.logging.directory;
+      const date = now().toISOString().slice(0, 10);
+      const file = join(directory, `${date}.jsonl`);
+      let raw: string;
+      try { raw = fs.readTextFile(file); } catch {
+        notify(ctx, `model-router: no audit data for ${date}`, "info");
+        return;
+      }
+      const entries: Record<string, unknown>[] = [];
+      for (const line of raw.split("\n")) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        try { entries.push(JSON.parse(trimmed)); } catch { /* skip malformed */ }
+      }
+      if (entries.length === 0) {
+        notify(ctx, "model-router: no audit entries found", "info");
+        return;
+      }
+      const currentSession = state.sessionId;
+      const sessionEntries = currentSession
+        ? entries.filter((e) => String(e.sessionId ?? "") === currentSession)
+        : entries;
+      const selected = sessionEntries.length > 0 ? sessionEntries : entries;
+      let strong = 0, eligible = 0, reject = 0;
+      let clsSkipped = 0, clsOk = 0, clsFailed = 0;
+      let weakTarget = 0;
+      const strongReasons = new Map<string, number>();
+      const weakTargets: { reqId: string; turn: number; conf: number; risk: string[]; weak: string }[] = [];
+      for (const entry of selected) {
+        const admission = entry.admission as Record<string, unknown> | undefined;
+        const verdict = String(admission?.verdict ?? "");
+        if (verdict === "strong") {
+          strong++;
+          for (const r of (admission?.reasonCodes as string[]) ?? []) strongReasons.set(r, (strongReasons.get(r) ?? 0) + 1);
+        } else if (verdict === "eligible") eligible++;
+        else if (verdict === "reject") reject++;
+        const cls = entry.classification as Record<string, unknown> | undefined;
+        const s = String(cls?.status ?? "skipped");
+        if (s === "skipped") clsSkipped++;
+        else if (s === "ok") clsOk++;
+        else if (s === "failed") clsFailed++;
+        if (s === "ok" && cls?.route === "weak") {
+          weakTarget++;
+          weakTargets.push({
+            reqId: String(entry.requestId ?? "").slice(0, 8),
+            turn: Number(entry.turnIndex ?? -1),
+            conf: (cls.confidence as number) ?? 0,
+            risk: (cls.riskFlags as string[]) ?? [],
+            weak: String(entry.selectedWeak ?? entry.targetModel ?? "?"),
+          });
+        }
+      }
+      const total = selected.length;
+      const pct = (n: number) => total > 0 ? ` (${(n / total * 100).toFixed(1)}%)` : "";
+      const reasonsList = [...strongReasons.entries()].map(([k, v]) => `${k}(${v})`).join(", ");
+      const lines: string[] = [
+        `Shadow Review \u2014 Session: ${state.sessionId ?? "(unknown)"}`,
+        `Time range: ${String(selected[0]?.timestamp ?? "").slice(0, 19)} \u2192 ${String(selected[selected.length - 1]?.timestamp ?? "").slice(0, 19)}`,
+        `Total records: ${total}`,
+        "",
+        "Route decision by admission:",
+        `  strong  ${String(strong).padStart(4)}${pct(strong)}     ${reasonsList}`,
+        `  reject  ${String(reject).padStart(4)}${pct(reject)}`,
+        `  eligible ${String(eligible).padStart(3)}${pct(eligible)}`,
+        "",
+        "Classification:",
+        `  skipped  ${String(clsSkipped).padStart(4)}${pct(clsSkipped)}`,
+        `  ok       ${String(clsOk).padStart(4)}${pct(clsOk)}`,
+        `  failed   ${String(clsFailed).padStart(4)}${pct(clsFailed)}`,
+        "",
+        `Weak-target (would have switched to weak): ${weakTarget}`,
+      ];
+      if (weakTargets.length > 0) {
+        lines.push("", "Weak-target entries:");
+        lines.push(`  ${"#".padEnd(3)} ${"request".padEnd(9)} turn  conf   risk        weak`);
+        weakTargets.forEach((wt, i) => {
+          lines.push(`  ${String(i + 1).padEnd(3)} ${wt.reqId.padEnd(9)} ${String(wt.turn).padEnd(5)} ${wt.conf.toFixed(2).padEnd(6)} ${JSON.stringify(wt.risk).padEnd(11)} ${wt.weak}`);
+        });
+      } else {
+        lines.push("No requests would have been switched to a weak model.");
+      }
+      lines.push("");
+      if (weakTarget === 0 && clsFailed === 0) {
+        if (strong === total) {
+          lines.push("Assessment: All requests were handled by the user model. The deterministic");
+          lines.push("admission rules caught everything before classification ran. Enabling active");
+          lines.push("mode would have had no effect on this session.");
+        } else {
+          lines.push("Assessment: No requests would have been downgraded. Shadow-mode switch to");
+          lines.push("active would have had no effect on this session.");
+        }
+      } else if (weakTarget > 0) {
+        lines.push(`Assessment: ${weakTarget} request(s) would have been served by a weak model.`);
+        lines.push("Review the weak-target entries above and consider whether those tasks");
+        lines.push("are simple enough before enabling active mode.");
+        if (clsFailed > 0) lines.push(`Note: ${clsFailed} classification(s) failed (fallback to user model).`);
+      }
+      if (clsFailed > 0 && weakTarget === 0) {
+        lines.push(`Note: ${clsFailed} classification(s) failed. The classifier pool may need attention.`);
+      }
+      notify(ctx, lines.join("\n"), "info");
     }
 
     // -----------------------------------------------------------------------

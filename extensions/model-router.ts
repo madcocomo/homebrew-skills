@@ -1378,6 +1378,7 @@ export interface SubPiInvocation {
     verification: Array<{ command?: string; postcondition?: string }>;
   };
   weakModel: { provider: string; id: string };
+  timeoutMs?: number;
 }
 
 export interface SubPiResult {
@@ -1614,8 +1615,11 @@ function readChildResult(
   if (!events || !final) {
     return { status: "failure", errorCode: "no_compact_result", errorMessage: "child returned no assistant result" };
   }
-  if (final.stopReason === "error" || final.stopReason === "aborted") {
+  if (final.stopReason === "error") {
     return { status: "failure", errorCode: "weak_model_failure", errorMessage: "child model failed" };
+  }
+  if (final.stopReason === "aborted") {
+    return { status: "aborted", errorCode: "child_aborted", errorMessage: "child task aborted" };
   }
   for (const event of assistants) {
     for (const call of event.toolCalls ?? []) {
@@ -1668,8 +1672,8 @@ export function createProductionSubPiRunner(
   const warn = deps?.warn ?? (() => {});
 
   return async (invocation: SubPiInvocation, signal?: AbortSignal): Promise<SubPiResult> => {
-    const weakModel = config.models?.weak[0];
-    if (!weakModel) {
+    const weakModel = invocation.weakModel;
+    if (!weakModel?.provider || !weakModel.id) {
       return { status: "error", errorCode: "no_weak_model", errorMessage: "no weak model configured" };
     }
     const runId = safeSlug(randomId(), "run");
@@ -1692,7 +1696,7 @@ export function createProductionSubPiRunner(
       );
       await tmuxOps.newSession(sessionName, `zsh ${quoteShell(scriptPath)}`);
 
-      const deadline = now().getTime() + config.subPi.timeoutMs;
+      const deadline = now().getTime() + (invocation.timeoutMs ?? config.subPi.timeoutMs);
       while (now().getTime() < deadline) {
         if (signal?.aborted) {
           return { status: "aborted", errorCode: "child_aborted", errorMessage: "child task aborted" };
@@ -1727,8 +1731,20 @@ export function registerSubPiTool(
   _warn: (message: string) => void,
   fs: RouterFs,
   isEnabled: () => boolean = () => true,
+  poolOptions?: {
+    health?: ModelHealthStore;
+    ensureAvailable?: (ctx: ExtensionContext) => Promise<boolean>;
+    onExhausted?: () => Promise<void>;
+  },
 ): () => void {
   const slotManager = createSlotManager(config.subPi.maxConcurrent);
+  const transientHealth: ModelHealthStore = poolOptions?.health ?? {
+    refresh() {}, getCooling() { return undefined; }, listCooling() { return []; },
+    markFailure(role, identity, reason) {
+      const failedAt = _now().getTime();
+      return { role, ...identity, reason, failedAt, retryAfter: failedAt + MODEL_COOLDOWN_MS };
+    },
+  };
   let unregistered = false;
   const reject = (reasonCode: string, message: string): never => {
     throw new SubPiError(reasonCode, `[${reasonCode}] ${message}`);
@@ -1750,6 +1766,9 @@ export function registerSubPiTool(
     ) {
       if (!isEnabled()) {
         reject("routing_off", "routing is disabled");
+      }
+      if (poolOptions?.ensureAvailable && !(await poolOptions.ensureAvailable(ctx))) {
+        reject("routing_suspended", "routing is suspended until a configured model is eligible");
       }
       // 1. cwd consistency
       if (params.cwd !== ctx.cwd || params.repositoryRoot !== ctx.cwd) {
@@ -1790,50 +1809,57 @@ export function registerSubPiTool(
       }
 
       try {
-        if (unregistered) {
-          reject("unregistered", "sub-pi tool is no longer available");
-        }
-
-        // 5. Verify weak model configured
-        const weakModel = config.models?.weak[0];
-        if (!weakModel) {
-          reject("no_weak_model", "no weak model configured");
-        }
-
-        // 6. Build invocation and call child runner
-        const invocation: SubPiInvocation = {
-          taskId: randomId(),
-          capsule: {
-            objective: capsule.objective,
-            cwd: capsule.cwd,
-            repositoryRoot: capsule.repositoryRoot,
-            allowedRead: capsule.allowedRead,
-            allowedWrite: capsule.allowedWrite,
-            forbidden: capsule.forbidden,
-            steps: capsule.steps,
-            expectedArtifacts: capsule.expectedArtifacts,
-            verification: capsule.verification,
-          },
-          weakModel: { provider: weakModel.provider, id: weakModel.id },
-        };
-
-        let result: SubPiResult;
-        try {
-          result = await childRunner(invocation, signal);
-        } catch (error) {
-          if (error instanceof SubPiError) throw error;
-          reject("child_runner_error", "child runner failed");
-        }
-
-        if (result.status === "success") {
-          return {
-            content: [{ type: "text" as const, text: result.summary ?? "task completed" }],
-            details: { status: "success", taskId: invocation.taskId },
+        if (unregistered) reject("unregistered", "sub-pi tool is no longer available");
+        if (!config.models?.weak.length) reject("no_weak_model", "no weak model configured");
+        const taskId = randomId();
+        const deadline = _now().getTime() + config.subPi.timeoutMs;
+        let pool = [...config.models.weak];
+        while (pool.length > 0) {
+          const remaining = deadline - _now().getTime();
+          if (remaining <= 0) reject("child_timeout", "child fallback budget exhausted");
+          const selection = await selectModelCandidate({
+            role: "weak", pool, registry: ctx.modelRegistry, health: transientHealth,
+          });
+          if (selection.status !== "ready") {
+            await poolOptions?.onExhausted?.();
+            reject("weak_pool_exhausted", "configured weak model pool is exhausted");
+          }
+          pool = pool.slice(pool.findIndex((item) => modelKey(item) === modelKey(selection.identity)) + 1);
+          const invocation: SubPiInvocation = {
+            taskId,
+            capsule: {
+              objective: capsule.objective, cwd: capsule.cwd, repositoryRoot: capsule.repositoryRoot,
+              allowedRead: capsule.allowedRead, allowedWrite: capsule.allowedWrite,
+              forbidden: capsule.forbidden, steps: capsule.steps,
+              expectedArtifacts: capsule.expectedArtifacts, verification: capsule.verification,
+            },
+            weakModel: { provider: selection.identity.provider, id: selection.identity.id },
+            timeoutMs: remaining,
           };
+          let result: SubPiResult;
+          try {
+            result = await childRunner(invocation, signal);
+          } catch (error) {
+            if (error instanceof SubPiError) throw error;
+            reject("child_runner_error", "child runner failed");
+          }
+          if (result.status === "success") {
+            return {
+              content: [{ type: "text" as const, text: result.summary ?? "task completed" }],
+              details: { status: "success", taskId },
+            };
+          }
+          const rawCode = result.errorCode ?? "child_failed";
+          const errorCode = /^[a-z0-9_]+$/.test(rawCode) ? rawCode : "child_failed";
+          const retryable = new Set(["weak_model_failure", "child_model_error", "child_timeout"]);
+          if (!retryable.has(errorCode) || result.status === "aborted" || signal?.aborted) {
+            reject(errorCode, "child task did not complete successfully");
+          }
+          transientHealth.markFailure("weak", selection.identity, "child_model_error");
         }
-        const rawCode = result.errorCode ?? "child_failed";
-        const errorCode = /^[a-z0-9_]+$/.test(rawCode) ? rawCode : "child_failed";
-        reject(errorCode, "child task did not complete successfully");
+        if (deadline <= _now().getTime()) reject("child_timeout", "child fallback budget exhausted");
+        await poolOptions?.onExhausted?.();
+        reject("weak_pool_exhausted", "configured weak model pool is exhausted");
       } finally {
         slotManager.release();
       }
@@ -2836,6 +2862,11 @@ export function createModelRouterExtension(dependencies: RouterDependencies = {}
           warn,
           fs,
           () => state.runtimeMode !== "off",
+          {
+            health,
+            ensureAvailable: (ctx) => ensureRouterAvailable(ctx),
+            onExhausted: () => suspendRouter("weak_pool_exhausted"),
+          },
         );
       }
     }

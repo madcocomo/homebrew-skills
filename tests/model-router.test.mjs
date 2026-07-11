@@ -2944,17 +2944,17 @@ test("Gate 14: slot manager acquire/release respects maxConcurrent", async () =>
 
 test("Gate 15: child runner failure returns isError=true with reason code", async () => {
   const errors = [
-    { status: "failure", errorCode: "child_nonzero", errorMessage: "exit code 1" },
-    { status: "timeout", errorCode: "child_timeout", errorMessage: "timed out" },
-    { status: "aborted", errorCode: "child_aborted", errorMessage: "aborted" },
-    { status: "error", errorCode: "no_weak_model", errorMessage: "no weak model" },
+    { result: { status: "failure", errorCode: "child_nonzero", errorMessage: "exit code 1" }, expectedCode: "child_nonzero" },
+    { result: { status: "timeout", errorCode: "child_timeout", errorMessage: "timed out" }, expectedCode: "weak_pool_exhausted" },
+    { result: { status: "aborted", errorCode: "child_aborted", errorMessage: "aborted" }, expectedCode: "child_aborted" },
+    { result: { status: "error", errorCode: "no_weak_model", errorMessage: "no weak model" }, expectedCode: "no_weak_model" },
   ];
   for (const expected of errors) {
     const { harness } = await setupSubPi({}, {
-      childRunner: async () => expected,
+      childRunner: async () => expected.result,
     });
     const error = await captureSubPiError(() => callRouteTaskBlock(harness));
-    assert.equal(error.reasonCode, expected.errorCode);
+    assert.equal(error.reasonCode, expected.expectedCode);
   }
 });
 
@@ -3206,6 +3206,138 @@ test("Gate 15: child failure releases the parent weak lease via evaluator", asyn
   // No second child runner call (parent didn't retry with another model)
   // Only one child call should have happened
   assert.equal(harness.childCalls.length, 1, "child must be called exactly once, no retry");
+});
+
+// ---------------------------------------------------------------------------
+// Model pool failover Gate 7: sub-pi weak fallback under one total budget
+// ---------------------------------------------------------------------------
+
+async function setupSubPiPool(options = {}) {
+  const weak = options.weak ?? [
+    { provider: "test", id: "weak-1", supportsImages: false },
+    { provider: "test", id: "weak-2", supportsImages: false },
+    { provider: "test", id: "weak-3", supportsImages: false },
+  ];
+  const registryModels = [fakeModel("test", "classifier-1"), ...weak.map((item) => fakeModel(item.provider, item.id))];
+  const harness = createHarness({ registryModels, cwd: REPO });
+  await setupExtension(harness, {
+    files: { [CONFIG_PATH]: JSON.stringify(baseConfig({
+      mode: "active",
+      models: { classifier: [CLASSIFIER_POOL[0]], weak },
+      subPi: { enabled: true, maxConcurrent: 1, timeoutMs: options.timeoutMs ?? 10000 },
+    })) },
+    classify: async () => ({ text: GOOD_CLASSIFIER_JSON }),
+    childRunner: options.childRunner,
+    now: options.now,
+  });
+  return harness;
+}
+
+test("subPi fallback: model-technical child failure cools candidate and retries next weak", async () => {
+  const calls = [];
+  const harness = await setupSubPiPool({
+    childRunner: async (invocation) => {
+      calls.push(invocation);
+      return invocation.weakModel.id === "weak-1"
+        ? { status: "failure", errorCode: "weak_model_failure" }
+        : { status: "success", summary: "fallback child complete" };
+    },
+  });
+  const result = await callRouteTaskBlock(harness);
+  assert.match(result.content[0].text, /fallback child complete/);
+  assert.deepEqual(calls.map((call) => call.weakModel.id), ["weak-1", "weak-2"]);
+  assert.equal(calls[0].taskId, calls[1].taskId, "logical task id stays stable across attempts");
+  assert.deepEqual(calls.map((call) => call.timeoutMs), [10000, 10000]);
+  const health = JSON.parse(harness.fs.files.get(HEALTH_PATH));
+  assert.equal(health.entries.find((entry) => entry.id === "weak-1").reason, "child_model_error");
+});
+
+test("subPi fallback: task, process, admission and user-abort failures never retry", async () => {
+  const failures = [
+    "scope_drift",
+    "scope_observation_uncertain",
+    "expected_artifact_missing",
+    "verification_failed",
+    "child_nonzero",
+    "child_aborted",
+    "no_compact_result",
+  ];
+  for (const errorCode of failures) {
+    let calls = 0;
+    const harness = await setupSubPiPool({
+      childRunner: async () => {
+        calls += 1;
+        return { status: errorCode === "child_aborted" ? "aborted" : "failure", errorCode };
+      },
+    });
+    const error = await captureSubPiError(() => callRouteTaskBlock(harness));
+    assert.equal(error.reasonCode, errorCode);
+    assert.equal(calls, 1, `${errorCode} must not retry`);
+  }
+});
+
+test("subPi timeout budget: attempts receive remaining total budget and unattempted weak stays healthy", async () => {
+  let time = Date.parse("2026-07-11T12:00:00.000Z");
+  const calls = [];
+  const harness = await setupSubPiPool({
+    timeoutMs: 10000,
+    now: () => new Date(time),
+    childRunner: async (invocation) => {
+      calls.push({ id: invocation.weakModel.id, timeoutMs: invocation.timeoutMs });
+      time += 7000;
+      return { status: "failure", errorCode: "weak_model_failure" };
+    },
+  });
+  const error = await captureSubPiError(() => callRouteTaskBlock(harness));
+  assert.equal(error.reasonCode, "child_timeout");
+  assert.deepEqual(calls, [
+    { id: "weak-1", timeoutMs: 10000 },
+    { id: "weak-2", timeoutMs: 3000 },
+  ]);
+  const health = JSON.parse(harness.fs.files.get(HEALTH_PATH));
+  assert.ok(!health.entries.some((entry) => entry.id === "weak-3"));
+});
+
+test("subPi exhausted weak pool suspends router with fixed non-sensitive error", async () => {
+  const harness = await setupSubPiPool({
+    weak: [
+      { provider: "test", id: "weak-1", supportsImages: false },
+      { provider: "test", id: "weak-2", supportsImages: false },
+    ],
+    childRunner: async () => ({ status: "failure", errorCode: "weak_model_failure", errorMessage: "SECRET provider body" }),
+  });
+  const error = await captureSubPiError(() => callRouteTaskBlock(harness));
+  assert.equal(error.reasonCode, "weak_pool_exhausted");
+  assert.ok(!error.message.includes("SECRET"));
+  assert.match(await routingStatusText(harness), /suspended/i);
+});
+
+test("production child runner uses invocation weak identity and invocation timeout", async () => {
+  const module = await loadModelRouterModule();
+  const parsed = module.parseModelRouterConfig(JSON.stringify(baseConfig({ mode: "active" })), { agentDir: AGENT_DIR });
+  const fs = createFakeFs({});
+  const writes = [];
+  const originalWrite = fs.writeFile.bind(fs);
+  fs.writeFile = (path, data, options) => { writes.push({ path, data }); originalWrite(path, data, options); };
+  let time = 0;
+  const runner = module.createProductionSubPiRunner(parsed.config, {
+    fs,
+    tmuxOps: { newSession: async () => {}, hasSession: async () => true, killSession: async () => {} },
+    now: () => new Date(time += 600),
+    randomId: () => "invocation-model",
+    env: {},
+    sleep: async () => {},
+  });
+  const result = await runner({
+    taskId: "task",
+    capsule: { objective: "x", cwd: REPO, repositoryRoot: REPO, allowedRead: [], allowedWrite: ["src/a.ts"], forbidden: [], steps: ["x"], expectedArtifacts: [{ path: "src/a.ts", condition: "exists" }], verification: [{ command: "echo ok" }] },
+    weakModel: { provider: "chosen", id: "fallback" },
+    timeoutMs: 1000,
+  });
+  assert.equal(result.status, "timeout");
+  const script = writes.find((entry) => entry.path.endsWith("run.zsh")).data;
+  assert.match(script, /chosen\/fallback/);
+  assert.ok(!script.includes("opencode/mimo-v2.5-free"));
 });
 
 // ---------------------------------------------------------------------------

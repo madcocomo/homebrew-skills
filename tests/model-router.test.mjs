@@ -1365,7 +1365,7 @@ test("audit log failures: single rate-limited warning, decisions continue", asyn
 });
 
 // ---------------------------------------------------------------------------
-// Gate 8: effect signals, progress and upgrade evaluation (pure functions)
+// Gate 8: effect signals, progress and weak-lease evaluation (pure functions)
 // ---------------------------------------------------------------------------
 
 async function getCapsule(prompt = FULL_TASK_PROMPT) {
@@ -1578,7 +1578,7 @@ test("effect evaluator: signals are unique, stably ordered, and empty batch mean
 });
 
 // ---------------------------------------------------------------------------
-// Gate 9: Active initial switching, weak lease, strong sticky
+// Gate 9: Active initial switching and weak-lease lifecycle
 // ---------------------------------------------------------------------------
 
 function activeFiles(extra = {}) {
@@ -1646,8 +1646,23 @@ test("active initial: hard rule prompt (scope ambiguous) does not call setModel 
   assert.equal(harness.classifierCalls.length, 0);
 });
 
-test("active initial: weak setModel false does not fallback, no abort", async () => {
+test("active strong verdict after a weak request restores the user model before no-op", async () => {
+  const returnModel = fakeModel("user", "selected-before-weak", ["text", "image"]);
+  const harness = await setupActive({ currentModel: returnModel });
+
+  await emitStart(harness);
+  assert.equal(harness.ctx.model.provider, "opencode", "first request should hold a weak lease");
+
+  await emitStart(harness, "just fix whatever is broken thanks");
+  assert.equal(harness.setModelCalls.length, 2, "second request should only restore the prior lease");
+  assert.strictEqual(harness.setModelCalls.at(-1).model, returnModel);
+  assert.strictEqual(harness.ctx.model, returnModel, "strong verdict must continue on the restored user model");
+});
+
+test("active initial: weak setModel false keeps the exact current model with no fallback", async () => {
+  const currentModel = fakeModel("user", "current-model", ["text", "image"]);
   const harness = await setupActive({
+    currentModel,
     setModelResults: { "opencode/mimo-v2.5-free": false },
   });
   await harness.emit("before_agent_start", {
@@ -1658,7 +1673,10 @@ test("active initial: weak setModel false does not fallback, no abort", async ()
   });
   assert.equal(harness.setModelCalls.length, 1, "only try weak once");
   assert.equal(harness.setModelCalls[0].provider, "opencode");
+  assert.strictEqual(harness.ctx.model, currentModel, "failed weak switch must preserve the current model object");
   assert.equal(harness.abortCalls, 0, "weak failure is not abort");
+  await harness.emit("agent_end", { type: "agent_end", messages: [] });
+  assert.equal(harness.setModelCalls.length, 1, "failed weak switch must not create a lease to restore");
 });
 
 test("active initial: setModel failure does not abort", async () => {
@@ -1708,11 +1726,11 @@ test("weak lease: healthy continuation keeps weak without setModel re-call", asy
   assert.equal(harness.setModelCalls.length, setModelBefore, "healthy continuation must not switch model");
 });
 
-test("weak lease: signal in turn_end does not switch model (no upgrade)", async () => {
-  const harness = await setupActive();
+test("weak lease: any turn_end effect signal restores the exact return model before the next request", async () => {
+  const returnModel = fakeModel("user", "return-after-signal", ["text", "image"]);
+  const harness = await setupActive({ currentModel: returnModel });
   await emitStart(harness);
   const setModelBefore = harness.setModelCalls.length;
-  // Nonzero exit tool
   await emitToolPair(harness, {
     id: "t1",
     toolName: "bash",
@@ -1721,7 +1739,10 @@ test("weak lease: signal in turn_end does not switch model (no upgrade)", async 
     details: { exitCode: 1 },
   });
   await emitTurnEnd(harness, { toolResultIds: ["t1"] });
-  assert.equal(harness.setModelCalls.length, setModelBefore, "signals are recorded but model is not switched");
+  const providerRequest = harness.markProviderRequest();
+  assert.equal(harness.setModelCalls.length, setModelBefore + 1, "effect signal must release the weak lease");
+  assert.strictEqual(harness.setModelCalls.at(-1).model, returnModel, "must restore the captured model object");
+  assert.ok(harness.setModelCalls.at(-1).seq < providerRequest.seq, "restore must precede the next provider request");
 });
 
 test("weak lease: turn_end with no tools does not trigger switch (run ends)", async () => {
@@ -1732,11 +1753,11 @@ test("weak lease: turn_end with no tools does not trigger switch (run ends)", as
   assert.equal(harness.setModelCalls.length, setModelBefore, "no tools means no continuation, no switch");
 });
 
-test("active: actual model mismatch is recorded but does not trigger model switch", async () => {
-  const harness = await setupActive();
+test("active: actual model mismatch releases the weak lease to its return model", async () => {
+  const returnModel = fakeModel("user", "return-after-mismatch");
+  const harness = await setupActive({ currentModel: returnModel });
   await emitStart(harness);
   const setModelBefore = harness.setModelCalls.length;
-  // Turn end with actual model different from weak target
   await emitToolPair(harness, {
     id: "t1", toolName: "edit",
     input: { path: `${REPO}/src/utils/date.ts`, oldText: "a", newText: "b" },
@@ -1744,9 +1765,10 @@ test("active: actual model mismatch is recorded but does not trigger model switc
   });
   await emitTurnEnd(harness, {
     toolResultIds: ["t1"],
-    model: "opencode/deepseek-v4-flash-free", // classifier model, not weak target
+    model: "opencode/deepseek-v4-flash-free",
   });
-  assert.equal(harness.setModelCalls.length, setModelBefore, "mismatch does not trigger model switch");
+  assert.equal(harness.setModelCalls.length, setModelBefore + 1);
+  assert.strictEqual(harness.setModelCalls.at(-1).model, returnModel);
 });
 
 // ---------------------------------------------------------------------------
@@ -1935,31 +1957,28 @@ test("integration: full shadow lifecycle has consistent request ids and zero set
   assert.equal(harness.classifierCalls.length, 1, "one classifier call");
 });
 
-test("integration: full active lifecycle initial weak, healthy continuation, upgrade on error", async () => {
+test("integration: full active lifecycle keeps a healthy lease and releases it on error", async () => {
   const harness = await setupActive();
-  // Initial weak
   await emitStart(harness);
   assert.equal(harness.setModelCalls.length, 1);
   assert.equal(harness.setModelCalls[0].id, "mimo-v2.5-free");
-  // Healthy continuation
   await emitToolPair(harness, { id: "t1", toolName: "edit", input: { path: `${REPO}/src/utils/date.ts` }, text: "fixed" });
   await emitTurnEnd(harness, { toolResultIds: ["t1"] });
-  assert.equal(harness.setModelCalls.length, 1, "healthy keeps weak");
-  // Upgrade on error
+  assert.equal(harness.setModelCalls.length, 1, "healthy continuation keeps weak");
   await emitToolPair(harness, { id: "t2", toolName: "bash", input: { command: "make" }, isError: true, details: { exitCode: 2 } });
   await emitTurnEnd(harness, { turnIndex: 1, toolResultIds: ["t2"] });
-  // No upgrade on error — signals recorded but model not switched
-  assert.equal(harness.setModelCalls.length, 1, "error does not trigger switch");
-  assert.equal(harness.setModelCalls[0]?.provider, "opencode");
+  assert.equal(harness.setModelCalls.length, 2, "error releases the weak lease");
+  assert.equal(harness.setModelCalls.at(-1).provider, "anthropic");
 });
 
-test("integration: signals are recorded but never trigger model switch", async () => {
+test("integration: evaluator signals release to the lease return model without fallback", async () => {
   const signals = [
     { name: "tool_error", item: { isError: true } },
     { name: "nonzero_exit", item: { toolName: "bash", input: { command: "make" }, exitCode: 1 } },
   ];
   for (const { name, item } of signals) {
-    const harness = await setupActive();
+    const returnModel = fakeModel("user", `return-${name}`);
+    const harness = await setupActive({ currentModel: returnModel });
     await emitStart(harness);
     const before = harness.setModelCalls.length;
     await emitToolPair(harness, {
@@ -1970,8 +1989,8 @@ test("integration: signals are recorded but never trigger model switch", async (
       text: "x",
     });
     await emitTurnEnd(harness, { toolResultIds: ["t1"] });
-    assert.equal(harness.setModelCalls.length, before,
-      `signal "${name}" must not trigger model switch`);
+    assert.equal(harness.setModelCalls.length, before + 1, `signal "${name}" must release the lease`);
+    assert.strictEqual(harness.setModelCalls.at(-1).model, returnModel);
   }
 });
 
@@ -2221,7 +2240,7 @@ test("Gate 14: slot manager acquire/release respects maxConcurrent", async () =>
 });
 
 // ---------------------------------------------------------------------------
-// Gate 15: Result processing, slot release, parent upgrade integration
+// Gate 15: Result processing, slot release, parent lease-release integration
 // ---------------------------------------------------------------------------
 
 test("Gate 15: child runner failure returns isError=true with reason code", async () => {
@@ -2415,9 +2434,9 @@ test("Gate 14: buildRunScript includes proxy env vars, source .zshrc, no bare &"
   assert.ok(!scriptContent.includes("pi-output.jsonl"), "script must not persist cumulative message updates");
 });
 
-test("Gate 15: child failure triggers parent route upgrade via evaluator", async () => {
-  // When sub-pi tool returns isError=true, the existing evaluator should detect
-  // tool_error signal and upgrade to strong. This test verifies the integration.
+test("Gate 15: child failure releases the parent weak lease via evaluator", async () => {
+  // A sub-pi tool error is an effect signal, so the parent returns to the model
+  // captured before entering its weak lease.
   const { harness } = await setupSubPi({}, {
     childRunner: async (invocation) => {
       harness.childCalls.push({ invocation, seq: harness.nextSeq() });
@@ -2466,7 +2485,7 @@ test("Gate 15: child failure triggers parent route upgrade via evaluator", async
     isError: true,
   });
 
-  // Turn end should trigger upgrade
+  // Turn end should release the weak lease.
   const setModelBefore = harness.setModelCalls.length;
   await harness.emit("turn_end", {
     type: "turn_end",
@@ -2481,9 +2500,10 @@ test("Gate 15: child failure triggers parent route upgrade via evaluator", async
     toolResults: [{ role: "toolResult", toolCallId: "subpi-1" }],
   });
 
-  // Signals recorded, model not switched
-  assert.equal(harness.setModelCalls.length, setModelBefore,
-    "child failure records signals but does not switch model");
+  // The tool error is an evaluator signal, so the parent lease returns to the user's model.
+  assert.equal(harness.setModelCalls.length, setModelBefore + 1,
+    "child failure must release the parent weak lease");
+  assert.equal(harness.setModelCalls.at(-1).provider, "anthropic");
   // No second child runner call (parent didn't retry with another model)
   // Only one child call should have happened
   assert.equal(harness.childCalls.length, 1, "child must be called exactly once, no retry");
@@ -2560,7 +2580,7 @@ test("session shutdown restores the activation model after an active weak route"
   assert.strictEqual(harness.setModelCalls.at(-1).model, FIXED_MODELS.find((model) => model.provider === "anthropic"));
 });
 
-test("active hard reject aborts instead of continuing on an arbitrary model", async () => {
+test("active image request unsupported by weak leaves the current model unchanged", async () => {
   const config = baseConfig({ mode: "active" });
   config.models.weak.supportsImages = false;
   // images + weakSupportsImages=false → strong verdict (no intervention), not abort
@@ -2580,8 +2600,9 @@ test("active hard reject aborts instead of continuing on an arbitrary model", as
   assert.equal(harness.setModelCalls.length, 0);
 });
 
-test("no-tool weak model failure is upgraded and audited at turn_end", async () => {
-  const harness = await setupActive();
+test("no-tool weak model error restores the lease return model at turn_end", async () => {
+  const returnModel = fakeModel("user", "return-after-model-error");
+  const harness = await setupActive({ currentModel: returnModel });
   await emitStart(harness);
   await harness.emit("turn_end", {
     type: "turn_end",
@@ -2596,21 +2617,48 @@ test("no-tool weak model failure is upgraded and audited at turn_end", async () 
     },
     toolResults: [],
   });
-  assert.equal(harness.setModelCalls.length, 1, "weak model failure does not trigger switch");
+  assert.equal(harness.setModelCalls.length, 2);
+  assert.strictEqual(harness.setModelCalls.at(-1).model, returnModel);
   const records = readLogRecords(harness);
   assert.ok(records.length >= 2, "should have initial + completion records");
 });
 
-test("agent end upgrades an unverified weak task to fixed strong", async () => {
-  const harness = await setupActive();
+test("agent_end restores each lease's exact return model, including a manual model change between tasks", async () => {
+  const firstReturnModel = fakeModel("user", "first-return");
+  const secondReturnModel = fakeModel("user", "second-return");
+  const harness = await setupActive({ currentModel: firstReturnModel });
+
   await emitStart(harness);
-  const before = harness.setModelCalls.length;
   await harness.emit("agent_end", { type: "agent_end", messages: [] });
-  assert.equal(harness.setModelCalls.length, before);
-  assert.equal(harness.setModelCalls.length, 1, "weak model failure does not trigger switch");
+  assert.strictEqual(harness.setModelCalls.at(-1).model, firstReturnModel);
+
+  harness.ctx.model = secondReturnModel;
+  await emitStart(harness);
+  await harness.emit("agent_end", { type: "agent_end", messages: [] });
+  assert.strictEqual(harness.setModelCalls.at(-1).model, secondReturnModel);
+  assert.equal(harness.setModelCalls.length, 4, "each task must switch weak then restore its own return model");
 });
 
-test("weak turn limit upgrades when the configured limit is reached", async () => {
+test("weak lease restore failure warns once, ends the lease, and never falls back", async () => {
+  const returnModel = fakeModel("user", "unavailable-return");
+  const warnings = [];
+  const harness = await setupActive({
+    currentModel: returnModel,
+    setModelResults: { "user/unavailable-return": false },
+  }, {
+    warn: (message) => warnings.push(message),
+  });
+  await emitStart(harness);
+  await harness.emit("agent_end", { type: "agent_end", messages: [] });
+  assert.equal(harness.setModelCalls.length, 2, "only weak and the captured return model may be attempted");
+  assert.strictEqual(harness.setModelCalls.at(-1).model, returnModel);
+  assert.match(warnings.join("\n"), /weak lease return model restore failed/i);
+
+  await harness.emit("agent_end", { type: "agent_end", messages: [] });
+  assert.equal(harness.setModelCalls.length, 2, "failed restore still ends the lease without retry or fallback");
+});
+
+test("weak turn limit emits a lease-release signal at the configured limit", async () => {
   const module = await loadModelRouterModule();
   const capsule = await getCapsule();
   const state = { ...freshEvalState(), weakContinuationCount: 3 };

@@ -4,7 +4,7 @@
 
 **Goal:** 在一个可独立关闭和删除的 Pi Extension 中实现设计文档的阶段 1～3：保守 shadow 路由、同 session active 路由，以及固定弱模型的 tmux child 块级委派。
 
-**Architecture:** 生产逻辑集中在 `extensions/model-router.ts`，内部以短小纯函数和可注入 adapter 分隔配置、固定模型解析、capsule、准入、分类、状态机、效果评估、日志、命令及 child runner。测试集中在 `tests/model-router.test.mjs`，通过 extension harness 和 fake dependencies 驱动真实事件顺序，不调用真实模型、API 或真实 child；运行时默认 `off`，所有失败都保守回到配置的 fixed strong 或显式中止。
+**Architecture:** 生产逻辑集中在 `extensions/model-router.ts`，内部以短小纯函数和可注入 adapter 分隔配置、固定模型解析、capsule、准入、分类、状态机、效果评估、日志、命令及 child runner。测试集中在 `tests/model-router.test.mjs`，通过 extension harness 和 fake dependencies 驱动真实事件顺序，不调用真实模型、API 或真实 child；运行时默认 `off`，active 只临时切到 fixed weak，其他情况保留或恢复用户模型，不存在 fixed strong/fallback。
 
 **Tech Stack:** TypeScript Pi Extension、Node.js 24、`node:test`、`assert/strict`、jiti、`@earendil-works/pi-coding-agent` 0.80.6、`@earendil-works/pi-ai/compat`、TypeBox、JSONL、tmux。
 
@@ -31,7 +31,7 @@
   - `using-superpowers/`
 - 不实现阶段 4：不修改 Pi core/SDK，不添加 request-scoped 临时 model API，不创建自定义 SDK launcher。
 - 不引入候选池、动态模型选择、health probe、熔断器、第三模型 fallback 或工具黑名单。
-- 不在单元测试中联网，不调用真实 classifier/weak/strong，不启动真实 child pi。
+- 不在单元测试中联网，不调用真实 classifier/weak，不启动真实 child pi。
 - 不把 prompt、工具完整输出、图片数据、环境变量、Authorization 或凭据写入日志/session state。
 
 ### 连续执行约定
@@ -143,16 +143,15 @@ fake harness 的公共观测至少包括：
 **Stop and report when:** 设计 schema 存在两种同样合理但行为不同的解释，或需要增加设计外字段。
 ---
 ## Gate 3：固定模型解析、auth 与图片声明交叉检查
-**Goal:** 只解析配置指定的 classifier/weak/strong，绝不搜索替代模型。
+**Goal:** 只解析配置指定的 classifier/weak，绝不搜索替代模型。
 **Files:**
 - Modify: `extensions/model-router.ts`
 - Modify: `tests/model-router.test.mjs`
 **先写失败测试:**
-- fake registry 只收到三个精确 `find(provider,id)`；没有 `getAll()`、候选遍历或模糊匹配。
+- fake registry 只收到两个精确 `find(provider,id)`；没有 `getAll()`、候选遍历或模糊匹配。
 - registry model `input` 含 `image` 且声明 true 时通过；声明 false 时仍保守视为不支持。
-- 声明 true 而 registry 缺 `image` 为配置错误；strong 的图片 fallback 不安全时 active 不可 ready。
-- active 要求 fixed strong 可解析且 auth `ok`；strong 缺失/无凭据时拒绝 active。
-- classifier/weak 缺失或无 auth 时 active 可以形成“全 strong degraded”状态，原因明确。
+- 声明 true 而 registry 缺 `image` 为配置错误。
+- active 要求 classifier/weak 均可解析且 auth `ok`；任一缺失或无凭据时拒绝 active。
 - shadow 仍解析固定模型并记录 readiness，但不调用 `pi.setModel()`。
 **最小实现:**
 - 实现 `resolveConfiguredModels(config, registry, mode)` 和 `resolveAuth`。
@@ -161,7 +160,7 @@ fake harness 的公共观测至少包括：
 **Verification:**
 - Run: `node --test --test-name-pattern='model resolver|auth|image capability|degraded' tests/model-router.test.mjs`
 - Pass: 所有 registry 调用与配置 identity 完全相等，候选发现调用为零。
-**Continue when:** fixed strong 的不可用路径始终阻止 active，而不是留在 weak。
+**Continue when:** classifier/weak 的不可用路径始终阻止 active，且 resolver 不存在 strong role。
 **Stop and report when:** 0.80.6 的 registry/auth 返回契约与测试假设不同；先读取本机 `.d.ts` 并报告，不以 `any` 静默绕过。
 ---
 ## Gate 4：Task capsule 构造、严格校验与路径约束
@@ -194,15 +193,15 @@ fake harness 的公共观测至少包括：
 - Modify: `extensions/model-router.ts`
 - Modify: `tests/model-router.test.mjs`
 **先写失败测试:**
-- 表驱动覆盖全部 reason code：图片、输入超限、scope/acceptance 缺失、broad design、cross boundary、long horizon、intent ambiguity、sensitive/irreversible、invalid scope、strong sticky。
+- 表驱动覆盖全部 reason code：图片、输入超限、scope/acceptance 缺失、broad design、cross boundary、long horizon、intent ambiguity、sensitive/irreversible、invalid scope。
 - 优先级固定为 `reject > strong > eligible`；多个规则同时命中时 reasonCodes 稳定排序且不被 classifier 改写。
 - `edit`、`write`、Git、进程重启本身不触发 strong。
 - 单 repo、局部明确、完整 capsule、图片兼容时返回 `eligible + capsule_complete`。
 - 五个危险回归类别至少覆盖：开放式根因分析、跨模块架构、共享状态长链、敏感/不可逆、冲突意图；fake classifier 即使返回高置信 weak 也不得放行。
-- 图片矩阵五种组合与设计一致；hard strong/reject 时 classifier 调用为零。
+- 图片矩阵与设计一致；weak 不支持图片时 strong verdict 表示不干预，classifier 调用为零。
 **最小实现:**
 - 实现纯函数 `evaluateAdmission(input)`，每个规则输出固定枚举 code。
-- 把图片判断置于 classifier 前；`weak=true,strong=false` 的图片配置在 active 明确拒绝，在 shadow 仅记录。
+- 把图片判断置于 classifier 前；weak 不支持图片时 active 不切模型，shadow 仅记录。
 - 将设计中的五类危险回归样例内联为 tests fixture；若后续取得原 40 点 corpus，再无损替换为原始样本。
 **Verification:**
 - Run: `node --test --test-name-pattern='admission|dangerous regression|image matrix' tests/model-router.test.mjs`
@@ -221,7 +220,7 @@ fake harness 的公共观测至少包括：
 - 只接受无 fence/无前后缀/无额外字段的单一 JSON object。
 - route 枚举、finite confidence、riskFlags 固定枚举、reasonCode 固定枚举、protocolVersion 全部严格校验。
 - `weak + confidence >= threshold + no flags` 才 weak；strong、低置信、任一 risk 均 strong。
-- malformed、timeout、abort、model/auth 缺失、provider error、空文本均为 `classifier_failure → fixed strong`。
+- malformed、timeout、abort、model/auth 缺失、provider error、空文本均为 `classifier_failure → strong verdict/no intervention`。
 - 每次 initial eligible 决策最多一次 classifier call，不调用第二 classifier。
 **最小实现:**
 - 导出 `parseClassifierResponse(text)`、`combineRouteDecision(admission,classification,threshold)`。
@@ -230,7 +229,7 @@ fake harness 的公共观测至少包括：
 **Verification:**
 - Run: `node --test --test-name-pattern='classifier protocol|classification input|classifier failure' tests/model-router.test.mjs`
 - Pass: malformed matrix 全部 strong；fake classifier 是唯一模型调用点。
-**Continue when:** 任意无法证明安全的 classifier 响应都得到 fixed strong。
+**Continue when:** 任意无法证明安全的 classifier 响应都得到 strong verdict，且不会调用 `setModel()`。
 **Stop and report when:** 需要放宽 JSON 语法、枚举或额外字段才能兼容某 provider；这属于协议变更。
 ---
 ## Gate 7：阶段 1 Shadow 编排与 JSONL 审计
@@ -280,28 +279,28 @@ fake harness 的公共观测至少包括：
 **Continue when:** evaluator 完全是确定性逻辑，且 continuation 不调用 classifier。
 **Stop and report when:** 0.80.6 无法观测某信号且不能从 `tool_call`、`tool_result`、`turn_end` 组合可靠推导；记录能力缺口，不解析任意自由文本冒充可靠信号。
 ---
-## Gate 9：阶段 2 Active 首轮切换、weak lease 与 strong sticky
-**Goal:** 在同一 session 内安全切换到配置 weak/strong，并证明切换发生在对应 provider request 前。
+## Gate 9：阶段 2 Active 首轮切换与 weak lease 生命周期
+**Goal:** 在同一 session 内只临时切换到配置 weak，并在 lease 结束时恢复进入 lease 前的用户模型。
 **Files:**
 - Modify: `extensions/model-router.ts`
 - Modify: `tests/model-router.test.mjs`
 **先写失败测试:**
-- active initial weak：`before_agent_start` await `setModel(fixed weak)` 后 harness 才允许 `markProviderRequest()`。
-- active initial strong/hard rule/classifier failure：只 set fixed strong。
-- weak setModel false/throw → 记录 `weak_unavailable` 并切 fixed strong；不试其他 weak。
-- strong 缺失、auth 失败或 setModel false：调用 `ctx.abort()`（仍活跃时），状态 `strong_switch_failed`，不得继续 weak。
+- active initial weak：先捕获 `ctx.model` 的精确对象，再 await `setModel(fixed weak)`；harness 才允许 `markProviderRequest()`。
+- active initial strong/hard rule/classifier failure：不调用 `setModel()`，保留用户当前模型。
+- weak setModel false/throw：保持原模型、不创建 lease、不试其他模型。
 - weak initial 返回隐藏 `model-router-capsule` custom message；shadow/off 不返回。
-- weak healthy tool batch 保持 lease，不重复 setModel/classifier；signal/cap 在 `turn_end` 返回前 await strong switch。
-- 同 run strong-sticky 后不降级；新用户请求重置后可重新 weak。
-- Assistant actual provider/model 与目标不一致时下一 continuation 升级。
+- weak healthy tool batch 保持 lease，不重复 setModel/classifier。
+- 任一 effect signal/cap 在 `turn_end` 返回前恢复该 lease 捕获的 return model。
+- weak response `error`/`aborted` 即使无工具 batch 也恢复；正常 `agent_end` 总是恢复。
+- 用户在任务之间手工换模后，下一 lease 捕获新模型；恢复失败 warning、结束 lease且不 fallback。
 **最小实现:**
-- 实现 route reducer：`undecided | weak-lease | strong-sticky`。
-- 实现唯一 actuator，只接受 resolved configured weak/strong；原子顺序为 signal → setModel → state/log。
-- `before_agent_start` 返回 capsule message；`turn_end` 无工具时不切模型。
+- route state 仅为 `undecided | weak-lease`；request 内保存进程内 `leaseReturnModel`。
+- 唯一 downgrade actuator 只接受 resolved configured weak；release actuator 只接受当前 lease 捕获的精确模型对象。
+- `before_agent_start` 返回 capsule message；`turn_end` 无工具且正常结束时由 `agent_end` 恢复。
 **Verification:**
-- Run: `node --test --test-name-pattern='active initial|weak lease|strong sticky|switch failed|provider order' tests/model-router.test.mjs`
-- Pass: harness sequence 证明两类 setModel 均早于下一 provider request；同 run 无 strong→weak。
-**Continue when:** active 所有路径只指向配置 weak/strong，strong 失败必显式中止。
+- Run: `node --test --test-name-pattern='active initial|weak lease|agent_end restores|no-tool weak model error|provider order' tests/model-router.test.mjs`
+- Pass: harness sequence 证明 weak switch 和 signal restore 均早于对应 provider request；每个 lease 恢复自己的 return model。
+**Continue when:** active 不存在 fixed strong/fallback 路径，shadow `setModel` 始终为零。
 **Stop and report when:** 实际 Pi 生命周期无法保证 awaited handler 先于 provider request；不得改用阶段 4 API。
 ---
 ## Gate 10：activation snapshot、`/routing` 命令、状态栏与恢复
@@ -311,12 +310,12 @@ fake harness 的公共观测至少包括：
 - Modify: `tests/model-router.test.mjs`
 **先写失败测试:**
 - 首次 off→shadow/active 捕获当前 provider/id，后续模式切换不覆盖 snapshot。
-- `/routing active` 严格验证 strong；classifier/weak 不可用显示 degraded all-strong。
+- `/routing active` 严格验证 classifier/weak；任一不可用则拒绝 active。
 - `/routing shadow` 从 active 进入时先 `waitForIdle()`、恢复 activation model，再进入 log-only。
 - `/routing off` 等待 idle、恢复 activation model、清 lease/fingerprints/capsule/signals/status，并 append 最小 state。
 - 恢复模型缺失/无 auth/setModel false 时 routing 仍关闭，但显示 `restore-error`，不尝试其他模型。
 - 非法参数给 usage；`status` 展示 config path、configured/effective mode、fixed roles、snapshot、lease、last reason/signal、log dir、subPi enabled，不展示 auth。
-- status bar 文本覆盖 shadow target/actual、active weak turn、active strong upgrade、error；`off` 清空。
+- status bar 文本覆盖 shadow target/actual、active weak turn、lease released/error；`off` 清空。
 - 首次启用仅注册一次 handler；反复 off/on 不重复处理事件。
 **最小实现:**
 - 实现 command parser、one-time handler guard、activation snapshot 和 UI formatter。
@@ -336,7 +335,7 @@ fake harness 的公共观测至少包括：
 **先写失败测试:**
 - `pi.appendEntry("model-router-state", ...)` 只含 runtime mode、activation identity、request id、route state、最近升级 reason；不含 prompt/tool/capsule/auth/log payload。
 - `session_start` 只从当前 branch 最后一个合法同 schema entry 恢复；malformed/旧 schema 忽略并 warning。
-- resume 恢复 mode/snapshot/strong sticky，但清 noProgress、operationCounts、tool observations、旧 capsule 和过期 request evaluator。
+- resume 恢复 mode/snapshot，但清 weak lease return object、noProgress、operationCounts、tool observations、旧 capsule 和过期 request evaluator。
 - 新 session id 不继承另一个 session 的内存状态。
 - restored off/restore-error 不启动分类；restored shadow 永不 setModel。
 - 用户手动 `model_select` 更新 actual observation，但不覆盖 activation snapshot；下一路由按 mode 决策。
@@ -358,15 +357,15 @@ fake harness 的公共观测至少包括：
 **先写失败测试:**
 - 一次完整 shadow run：initial eligible→weak target、两个工具 continuation、acceptance，classifier 一次、setModel 零次、关联 id 一致。
 - 一次 active success run：initial weak、healthy continuation、结束；actual/usage/model change 观测可对账。
-- 参数化注入 nonzero、tool error、scope drift、uncertain bash、repeat、artifact missing、verification failed、no progress、turn cap，均在下一 request 前 100% fixed strong。
-- active degraded all-strong、strong switch failure、off restore failure、logging failure 均不产生未处理异常或隐式 fallback。
+- 参数化注入 nonzero、tool error、scope drift、uncertain bash、repeat、artifact missing、verification failed、no progress、turn cap，均在下一 request 前恢复 lease return model。
+- weak switch failure、lease restore failure、off restore failure、logging failure均不产生隐式 fallback。
 - config mode 默认为 off；example 复制后若不改 mode 不会切模型。
 **最小实现:**
 - 只补齐 harness integration helpers和缺失断言；禁止借此重构无关代码。
 - 在测试说明中区分“代码具备 active”与“生产允许 active”。
 **Verification:**
 - Run: `node --test tests/model-router.test.mjs`
-- Pass: 全部离线测试 PASS；shadow `setModel=0`；每个注入升级率 `100%`。
+- Pass: 全部离线测试 PASS；shadow `setModel=0`；每个注入的 lease 释放率 `100%`。
 **Continue when:** 可以继续实现阶段 3，但生产配置仍保持 `off` 或 `shadow`。
 **Production rollout hold:**
 - 在任何真实环境把 mode 改成 active 前，必须另行收集不少于 100 个 shadow 决策并人工标注。
@@ -419,8 +418,8 @@ fake harness 的公共观测至少包括：
 **Continue when:** child runner 在无网络测试中完全由 fake fs/exec/clock 驱动。
 **Stop and report when:** 必须使用 `--session`/parentSession、修改 export/session tree，或直接执行长运行 `pi` 而非 tmux。
 ---
-## Gate 15：child 结果验收、父 strong 升级与独立剥离
-**Goal:** child 的任何执行/验收失败都成为工具错误，并在父 continuation 升级 fixed strong；成功只返回紧凑摘要。
+## Gate 15：child 结果验收、父 weak lease 释放与独立剥离
+**Goal:** child 的任何执行/验收失败都成为工具错误，并在父 continuation 释放 weak lease；成功只返回紧凑摘要。
 **Files:**
 - Modify: `extensions/model-router.ts`
 - Modify: `tests/model-router.test.mjs`
@@ -428,17 +427,17 @@ fake harness 的公共观测至少包括：
 - fake child success + artifacts + verification 通过：工具返回 compact content/details，不包含完整 event stream。
 - nonzero、timeout、abort、scope drift、artifact missing、verification missing/fail 分别明确失败。
 - 因 Pi 0.80.6 工具返回值不能直接设置 `isError`，失败路径必须 throw；harness 转换为 `tool_result.isError=true`。
-- parent weak lease 收到 child tool error 后，`turn_end` 在下一 provider request 前切 fixed strong 并 strong-sticky。
-- child 失败不启动另一个 child model，不把任务改派 child strong；父路由才负责 fixed strong。
+- parent weak lease 收到 child tool error 后，`turn_end` 在下一 provider request 前恢复其 lease return model。
+- child 失败不启动另一个 child model，也不把任务改派任何 fixed strong/fallback。
 - timeout/结束后释放 concurrency slot；清理失败只 warning，不覆盖主要 child failure。
 - `subPi.enabled=false`、删除工具注册分支或删除整个 Extension 的剥离检查均不要求修改 `plan-runner.ts`/Pi core。
 **最小实现:**
 - 实现 child result validator，复用 artifact/verification/scope evaluator。
 - execute 成功返回受限 summary；失败抛出只含 task id/reason code 的 Error。
-- tool observer 把 `route_task_block` 的 isError 纳入 `tool_error/weak_model_failure` 升级路径。
+- tool observer 把 `route_task_block` 的 isError 纳入 `tool_error/weak_model_failure` lease-release 路径。
 **Verification:**
-- Run: `node --test --test-name-pattern='child result|child failure|parent upgrade|subPi cleanup' tests/model-router.test.mjs`
-- Pass: 所有 child 失败案例 parent strong 升级率 `100%`；child model 调用 identity 集合只有 fixed weak。
+- Run: `node --test --test-name-pattern='child result|child failure|parent weak lease|subPi cleanup' tests/model-router.test.mjs`
+- Pass: 所有 child 失败案例 parent weak lease 释放率 `100%`；child model 调用 identity 集合只有 fixed weak。
 **Continue when:** 阶段 3 可通过单个配置开关关闭，主路由无 child 依赖。
 **Stop and report when:** child 失败后无法让 Pi 产生 `isError=true`，或父 continuation 不能观测该结果。
 ---
@@ -472,7 +471,7 @@ fake harness 的公共观测至少包括：
 **Stop and report when:** 现有 plan-runner 测试因本任务改动失败，或修复需要修改允许列表以外文件。
 ---
 ## Gate 17：最终独立联网 smoke（不与单元测试混报）
-**Goal:** 仅在用户显式提供安全测试配置和授权后，验证真实 fixed classifier/weak/strong 基本连通；该 gate 独立于离线验收。
+**Goal:** 仅在用户显式提供安全测试配置和授权后，验证真实 fixed classifier/weak 基本连通及用户模型恢复；该 gate 独立于离线验收。
 **Files:**
 - 不修改仓库文件。
 - 使用用户目录的临时配置副本和临时日志目录；结束后恢复原配置/模型。
@@ -482,7 +481,7 @@ fake harness 的公共观测至少包括：
 **Preconditions:**
 - Gate 16 全绿。
 - 用户明确允许联网和 provider 成本。
-- 配置严格指定 classifier/weak/strong，`mode` 初始为 `shadow`；不得把 key 写入配置。
+- 配置严格指定 classifier/weak，`mode` 初始为 `shadow`；不得把 key 写入配置。
 - 先记录 activation model，并准备 `/routing off` 恢复步骤。
 **最小实现:**
 - 不改生产代码；只在临时目录创建 capsule、smoke task、assertion script 和结果目录，使用现有 Extension 完成一次最小观察。
@@ -495,11 +494,11 @@ fake harness 的公共观测至少包括：
 - 结束时 `/routing off`，检查状态栏清理，关闭本次记录的 tmux session，恢复原用户配置。
 **Verification:**
 - Run in project-prefixed tmux: `pi -e ./extensions/model-router.ts --mode json -p @<smoke-task-file>`
-- Pass: 只出现配置中的三个 identity；shadow 不切模型；active（若获批）可恢复；日志不含敏感正文。
+- Pass: 只出现配置中的 classifier/weak identity 及用户当前模型；shadow 不切模型；active（若获批）可恢复每个 lease 的 return model；日志不含敏感正文。
 **Failure classification:**
 - 网络、DNS、rate limit、provider 5xx、模型不可用、凭据缺失属于 `SMOKE BLOCKED/FAILED`，不得改写为单元测试失败。
-- classifier 协议错误应记录 `classifier_failure → fixed strong`；不得尝试第二模型。
-- strong 不可用时 active smoke 立即停止；不得继续 weak。
+- classifier 协议错误应记录 `classifier_failure → no intervention`；不得尝试第二模型。
+- weak 不可用时 active smoke 保持用户模型；不得尝试 fallback。
 **Stop and report when:** 未获联网/成本授权、需要健康探针/候选 fallback、需要把 secret 写入文件，或清理/恢复失败。
 ---
 
@@ -536,12 +535,12 @@ git diff --check
 
 - Gate 1～16 的离线验证全部有新鲜 PASS 输出。
 - 默认/缺配置为 off；shadow `setModel` 次数严格为 0。
-- active 只在 `before_agent_start` 和有 continuation 的 `turn_end` 切 fixed weak/strong。
-- deterministic + classifier + capsule + image + upgrade 五重安全门均有回归测试。
-- 所有指定执行失败信号都会升级 fixed strong；strong switch 失败会 abort/显式失败。
+- active 只在 `before_agent_start` 切 fixed weak，并在 `turn_end`/`agent_end` 恢复 lease return model。
+- deterministic + classifier + capsule + image + lease-release 五重安全门均有回归测试。
+- 所有指定执行失败信号都会释放 weak lease；恢复失败明确 warning 且不 fallback。
 - session state、JSONL 和 child summary 均通过隐私 allowlist。
 - `/routing off` 恢复 activation model并清状态；恢复失败明确显示且不 fallback。
-- sub-pi 只使用 fixed weak tmux child，失败回父 fixed strong，可独立关闭/删除。
+- sub-pi 只使用 fixed weak tmux child，失败触发父 weak lease 释放，可独立关闭/删除。
 - 阶段 4、Pi core/SDK、`extensions/plan-runner.ts` 完全未触碰。
 - 最终 Git hygiene 符合第 3 节。
 - Gate 17 若未授权或因网络/provider 失败，应单独报告为“未运行/blocked”，不影响离线完成结论；但不得声称真实 provider smoke 已通过。

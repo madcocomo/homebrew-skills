@@ -1572,7 +1572,7 @@ export async function resolveConfiguredModels(
 }
 
 // ---------------------------------------------------------------------------
-// Effect signals, progress and upgrade evaluation (design sections 13-14)
+// Effect signals, progress and weak-lease evaluation (design sections 13-14)
 // ---------------------------------------------------------------------------
 
 export type ScopeStatus = "in_scope" | "out_of_scope" | "uncertain" | "no_path";
@@ -1718,8 +1718,8 @@ function detectProgress(input: BatchEvaluationInput, newFingerprints: Set<string
 }
 
 /**
- * Deterministic evaluation of one tool batch. Produces upgrade signals and
- * progress accounting; never intercepts tools and never calls a model.
+ * Deterministic evaluation of one tool batch. Produces weak-lease release
+ * signals and progress accounting; never intercepts tools and never calls a model.
  */
 export function evaluateToolBatch(input: BatchEvaluationInput): BatchEvaluation {
   if (input.batch.length === 0) {
@@ -1832,6 +1832,7 @@ export function formatAuditRecord(input: AuditRecordInput): Record<string, unkno
 // ---------------------------------------------------------------------------
 
 type ModelIdentity = { provider: string; id: string };
+type RuntimeModel = NonNullable<ExtensionContext["model"]>;
 
 export type RouteState = "undecided" | "weak-lease";
 
@@ -1856,6 +1857,7 @@ interface RequestState {
   decision: RouteDecision;
   capsule?: TaskCapsule;
   targetModel: ModelIdentity | null;
+  leaseReturnModel?: RuntimeModel;
   weakContinuationCount: number;
   noProgressCount: number;
   operationCounts: Map<string, number>;
@@ -2037,6 +2039,9 @@ export function createModelRouterExtension(dependencies: RouterDependencies = {}
       ctx: ExtensionContext,
     ): Promise<BeforeAgentStartEventResult | void> {
       if (state.runtimeMode === "off" || !state.config?.models) return;
+      if (state.runtimeMode === "active" && state.request?.routeState === "weak-lease") {
+        await releaseWeakLease();
+      }
       captureActivationModel(ctx);
       const readiness = await ensureReadiness(ctx);
       const requestId = randomId();
@@ -2083,10 +2088,12 @@ export function createModelRouterExtension(dependencies: RouterDependencies = {}
       // === Gate 9: Active mode model switching ===
       if (state.runtimeMode === "active") {
         const target = state.request.targetModel;
-        if (target && decision.route === "weak") {
+        if (target && decision.route === "weak" && ctx.model) {
+          const leaseReturnModel = ctx.model;
           const switched = await applySetModel(target, ctx);
           if (switched) {
             state.request.routeState = "weak-lease";
+            state.request.leaseReturnModel = leaseReturnModel;
             if (admission.capsule) {
               const capsule = admission.capsule;
               hookResult = {
@@ -2182,6 +2189,12 @@ export function createModelRouterExtension(dependencies: RouterDependencies = {}
         .map((result) => request.observations.get(result.toolCallId))
         .filter((observation): observation is ToolObservation => observation !== undefined);
 
+      const weakResponseFailed = message.stopReason === "error" || message.stopReason === "aborted";
+      if (weakResponseFailed && request.routeState === "weak-lease") {
+        request.signals.add("weak_model_failure");
+        await releaseWeakLease();
+      }
+
       if (batch.length === 0) {
         const artifactsPresent = request.capsule
           ? checkExpectedArtifacts(request.capsule, (path) => fs.exists(path)).missing.length === 0
@@ -2236,6 +2249,9 @@ export function createModelRouterExtension(dependencies: RouterDependencies = {}
         request.noProgressCount = evalState.noProgressCount;
         request.weakContinuationCount = evalState.weakContinuationCount;
         for (const signal of evaluation.signals) request.signals.add(signal);
+        if (state.runtimeMode === "active" && evaluation.signals.length > 0) {
+          await releaseWeakLease();
+        }
       }
 
       const artifactsPresent = request.capsule
@@ -2272,7 +2288,6 @@ export function createModelRouterExtension(dependencies: RouterDependencies = {}
       if (request.capsule?.verification.length && !request.verificationSucceeded) {
         request.signals.add("acceptance_missing_after_work");
       }
-      // Active mode: no upgrade — signals are recorded but model is not switched
       if (state.config && request.signals.size > 0) {
         appendAudit(formatAuditRecord({
           timestamp: now().toISOString(),
@@ -2292,6 +2307,7 @@ export function createModelRouterExtension(dependencies: RouterDependencies = {}
           maxReasonChars: state.config.logging.maxReasonChars,
         }));
       }
+      await releaseWeakLease();
       updateStatusBar(ctx);
     }
 
@@ -2374,6 +2390,30 @@ export function createModelRouterExtension(dependencies: RouterDependencies = {}
       } catch {
         return false;
       }
+    }
+
+    async function releaseWeakLease(): Promise<boolean> {
+      const request = state.request;
+      if (state.runtimeMode !== "active" || request?.routeState !== "weak-lease") return true;
+
+      const returnModel = request.leaseReturnModel;
+      request.routeState = "undecided";
+      request.leaseReturnModel = undefined;
+      if (!returnModel) {
+        warn("model-router: weak lease return model missing; lease ended without fallback");
+        return false;
+      }
+
+      let restored = false;
+      try {
+        restored = (await pi.setModel(returnModel)) !== false;
+      } catch {
+        restored = false;
+      }
+      if (!restored) {
+        warn("model-router: weak lease return model restore failed; lease ended without fallback");
+      }
+      return restored;
     }
 
     async function captureAndRegisterHandlers(): Promise<void> {

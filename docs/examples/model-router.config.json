@@ -2,13 +2,22 @@
   "version": 1,
   "mode": "off",
   "models": {
-    "classifier": { "provider": "deepseek", "id": "deepseek-v4-flash", "supportsImages": false },
-    "weak": { "provider": "google", "id": "gemini-3.5-flash", "supportsImages": true }
+    "classifier": [
+      { "provider": "nvidia-free", "id": "z-ai/glm-5.2", "supportsImages": false },
+      { "provider": "nvidia-free", "id": "deepseek-ai/deepseek-v4-pro", "supportsImages": false },
+      { "provider": "deepseek", "id": "deepseek-v4-flash", "supportsImages": false }
+    ],
+    "weak": [
+      { "provider": "google", "id": "gemini-3.5-flash", "supportsImages": true },
+      { "provider": "opencode", "id": "mimo-v2.5-free", "supportsImages": true },
+      { "provider": "opencode", "id": "deepseek-v4-flash-free", "supportsImages": false }
+    ]
   },
   "classification": {
     "ruleProfile": "conservative-v1",
     "minWeakConfidence": 0.9,
     "timeoutMs": 20000,
+    "totalTimeoutMs": 30000,
     "maxInputChars": 12000
   },
   "limits": {
@@ -19,5 +28,10 @@
   "logging": {
     "directory": "~/.pi/agent/model-router-logs",
     "maxReasonChars": 240
+  },
+  "subPi": {
+    "enabled": false,
+    "maxConcurrent": 1,
+    "timeoutMs": 1800000
   }
 }

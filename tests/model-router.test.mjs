@@ -2585,11 +2585,80 @@ test("/routing: status displays config path, modes, snapshot, lease", async () =
   assert.ok(text.includes(CONFIG_PATH), "config path");
   assert.ok(text.includes("shadow"), "mode");
   assert.ok(text.includes("target model") || text.includes("opencode/mimo"), "target");
-  assert.match(text, /classifier model: opencode\/deepseek-v4-flash-free/);
-  assert.match(text, /weak model: opencode\/mimo-v2.5-free/);
+  assert.match(text, /classifier pool:\s*1\. opencode\/deepseek-v4-flash-free/s);
+  assert.match(text, /weak pool:\s*1\. opencode\/mimo-v2.5-free/s);
   assert.ok(!/strong model/.test(text), "strong model line removed");
   assert.match(text, /log directory:/);
   assert.match(text, /sub-pi: disabled/);
+});
+
+test("status: shows ordered pools, selected identities, cooldowns, suspension and timeout budgets", async () => {
+  const weak = [
+    { provider: "test", id: "weak-1", supportsImages: true },
+    { provider: "test", id: "weak-2", supportsImages: true },
+  ];
+  const harness = createHarness({
+    registryModels: [
+      ...POOL_REGISTRY_MODELS,
+      fakeModel("test", "weak-2", ["text", "image"]),
+    ],
+    setModelResults: { "test/weak-1": false },
+    cwd: REPO,
+  });
+  await setupExtension(harness, {
+    files: { [CONFIG_PATH]: JSON.stringify(baseConfig({
+      mode: "active",
+      models: { classifier: CLASSIFIER_POOL, weak },
+      classification: { timeoutMs: 5000, totalTimeoutMs: 12000 },
+    })) },
+    classify: async (request) => ({ text: GOOD_CLASSIFIER_JSON }),
+  });
+  await emitStart(harness);
+  const text = await routingStatusText(harness);
+  assert.match(text, /classifier pool:\s*1\. test\/classifier-1\s*2\. test\/classifier-2\s*3\. test\/classifier-3/s);
+  assert.match(text, /weak pool:\s*1\. test\/weak-1\s*2\. test\/weak-2/s);
+  assert.match(text, /selected classifier: test\/classifier-1/);
+  assert.match(text, /selected weak: test\/weak-2/);
+  assert.match(text, /cooling: weak test\/weak-1 reason=set_model_failed retryAfter=/);
+  assert.match(text, /classification timeout: 5000ms/);
+  assert.match(text, /classification total timeout: 12000ms/);
+});
+
+test("audit: fallback metadata uses exact allowlist and excludes provider/prompt/error payloads", async () => {
+  const weak = [
+    { provider: "test", id: "weak-1", supportsImages: true },
+    { provider: "test", id: "weak-2", supportsImages: true },
+  ];
+  const harness = createHarness({
+    registryModels: [...POOL_REGISTRY_MODELS, fakeModel("test", "weak-2", ["text", "image"])],
+    setModelResults: { "test/weak-1": false },
+    cwd: REPO,
+  });
+  await setupExtension(harness, {
+    files: { [CONFIG_PATH]: JSON.stringify(baseConfig({ mode: "active", models: { classifier: CLASSIFIER_POOL, weak } })) },
+    classify: async (request) => {
+      if (request.model.id === "classifier-1") throw new Error("LEAK-MARKER provider response Authorization");
+      return { text: GOOD_CLASSIFIER_JSON };
+    },
+  });
+  await emitStart(harness, FULL_TASK_PROMPT + " PRIVATE-PROMPT-BODY");
+  const record = readLogRecords(harness).at(-1);
+  const allowed = new Set([
+    "schemaVersion", "timestamp", "mode", "sessionId", "requestId", "turnIndex",
+    "decisionKind", "admission", "classification", "targetModel", "actualModel",
+    "reasonCodes", "toolSummary", "providerLatencyMs", "actualUsage",
+    "expectedAcceptanceHit", "selectedClassifier", "selectedWeak", "fallbackCount",
+    "failureCodes",
+  ]);
+  for (const key of Object.keys(record)) assert.ok(allowed.has(key), `unexpected audit field ${key}`);
+  assert.equal(record.selectedClassifier, "test/classifier-2");
+  assert.equal(record.selectedWeak, "test/weak-2");
+  assert.equal(record.fallbackCount, 2);
+  assert.ok(record.failureCodes.every((code) => /^[a-z_]+$/.test(code)));
+  const raw = JSON.stringify(record);
+  for (const secret of ["LEAK-MARKER", "Authorization", "provider response", "PRIVATE-PROMPT-BODY"]) {
+    assert.ok(!raw.includes(secret), `audit leaked ${secret}`);
+  }
 });
 
 test("/routing: off and status work in non-UI context without error", async () => {

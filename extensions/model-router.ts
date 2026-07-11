@@ -2161,6 +2161,8 @@ export interface AuditRecordInput {
   toolSummary: ToolSummary;
   actualUsage: unknown;
   expectedAcceptanceHit: boolean | null;
+  fallbackCount?: number;
+  failureCodes?: string[];
   maxReasonChars: number;
 }
 
@@ -2187,6 +2189,18 @@ export function formatAuditRecord(input: AuditRecordInput): Record<string, unkno
     providerLatencyMs: null,
     actualUsage: input.actualUsage ?? null,
     expectedAcceptanceHit: input.expectedAcceptanceHit,
+    selectedClassifier: input.classification.status === "skipped"
+      ? null
+      : input.classification.classifierModel ?? null,
+    selectedWeak: input.targetModel,
+    fallbackCount: input.fallbackCount ?? (
+      input.classification.status === "skipped"
+        ? 0
+        : Math.max(0, (input.classification.attemptCount ?? 1) - 1)
+    ),
+    failureCodes: input.failureCodes ?? (
+      input.classification.status === "skipped" ? [] : input.classification.failureCodes ?? []
+    ),
   };
 }
 
@@ -2220,6 +2234,8 @@ interface RequestState {
   decision: RouteDecision;
   capsule?: TaskCapsule;
   targetModel: ModelIdentity | null;
+  weakFallbackCount: number;
+  weakFailureCodes: string[];
   leaseReturnModel?: RuntimeModel;
   weakContinuationCount: number;
   noProgressCount: number;
@@ -2479,6 +2495,20 @@ export function createModelRouterExtension(dependencies: RouterDependencies = {}
       };
     }
 
+    function requestAuditMetadata(request: RequestState): { fallbackCount: number; failureCodes: string[] } {
+      const classification = request.classification;
+      const classifierFallbacks = classification.status === "skipped"
+        ? 0
+        : Math.max(0, (classification.attemptCount ?? 1) - 1);
+      const classifierFailures = classification.status === "skipped"
+        ? []
+        : classification.failureCodes ?? [];
+      return {
+        fallbackCount: classifierFallbacks + request.weakFallbackCount,
+        failureCodes: [...classifierFailures, ...request.weakFailureCodes],
+      };
+    }
+
     function updateStatusBar(ctx: ExtensionContext): void {
       try {
         ctx.ui.setStatus("model-router", statusBarText(state));
@@ -2579,6 +2609,8 @@ export function createModelRouterExtension(dependencies: RouterDependencies = {}
         decision,
         capsule: admission.capsule,
         targetModel: targetIdentity(decision.route, weakSelection),
+        weakFallbackCount: 0,
+        weakFailureCodes: [],
         weakContinuationCount: 0,
         noProgressCount: 0,
         operationCounts: new Map(),
@@ -2597,6 +2629,10 @@ export function createModelRouterExtension(dependencies: RouterDependencies = {}
         if (decision.route === "weak" && ctx.model) {
           const leaseReturnModel = ctx.model;
           const switched = await switchWeakModel(ctx, requireImages);
+          state.request.weakFailureCodes = [...switched.failureCodes];
+          state.request.weakFallbackCount = switched.failureCodes.filter(
+            (code) => code !== "cooling_down" && code !== "image_not_supported",
+          ).length;
           if (switched.status === "ready") {
             state.request.targetModel = {
               provider: switched.identity.provider,
@@ -2640,6 +2676,7 @@ export function createModelRouterExtension(dependencies: RouterDependencies = {}
         toolSummary: { count: 0, errors: 0, nonzeroExits: 0, operationHashes: [] },
         actualUsage: null,
         expectedAcceptanceHit: null,
+        ...requestAuditMetadata(state.request),
         maxReasonChars: state.config.logging.maxReasonChars,
       }));
       updateStatusBar(ctx);
@@ -2727,6 +2764,7 @@ export function createModelRouterExtension(dependencies: RouterDependencies = {}
           toolSummary: { count: 0, errors: 0, nonzeroExits: 0, operationHashes: [] },
           actualUsage: message.usage ?? null,
           expectedAcceptanceHit: request.verificationSucceeded && artifactsPresent,
+          ...requestAuditMetadata(request),
           maxReasonChars: state.config.logging.maxReasonChars,
         }));
         updateStatusBar(ctx);
@@ -2785,6 +2823,7 @@ export function createModelRouterExtension(dependencies: RouterDependencies = {}
         toolSummary: toolSummaryOf(batch),
         actualUsage: message.usage ?? null,
         expectedAcceptanceHit: request.verificationSucceeded && artifactsPresent,
+        ...requestAuditMetadata(request),
         maxReasonChars: state.config.logging.maxReasonChars,
       }));
       for (const result of event.toolResults) request.observations.delete(result.toolCallId);
@@ -2817,6 +2856,7 @@ export function createModelRouterExtension(dependencies: RouterDependencies = {}
           toolSummary: { count: 0, errors: 0, nonzeroExits: 0, operationHashes: [] },
           actualUsage: null,
           expectedAcceptanceHit: false,
+          ...requestAuditMetadata(request),
           maxReasonChars: state.config.logging.maxReasonChars,
         }));
       }
@@ -2876,7 +2916,7 @@ export function createModelRouterExtension(dependencies: RouterDependencies = {}
       handler: async (args: string, ctx: ExtensionCommandContext) => {
         const arg = args.trim().toLowerCase();
         if (arg === "status" || arg === "") {
-          reportStatus(state, configPath, ctx);
+          reportStatus(state, configPath, ctx, health.listCooling());
           return;
         }
         if (arg === "off") {
@@ -3146,7 +3186,7 @@ function statusBarText(state: RuntimeState): string | undefined {
   }
   if (request?.routeState === "weak-lease") {
     const cap = state.config?.limits.maxWeakContinuationTurns ?? 0;
-    return `routing:active · weak · turn=${request.weakContinuationCount}/${cap}`;
+    return `routing:active · weak=${modelKey(request.targetModel) ?? "-"} · turn=${request.weakContinuationCount}/${cap}`;
   }
   return `routing:active · strong`;
 }
@@ -3159,7 +3199,12 @@ function notify(ctx: ExtensionContext, message: string, type: "info" | "warning"
   }
 }
 
-function reportStatus(state: RuntimeState, configPath: string, ctx: ExtensionCommandContext): void {
+function reportStatus(
+  state: RuntimeState,
+  configPath: string,
+  ctx: ExtensionCommandContext,
+  cooling: ModelHealthEntry[] = [],
+): void {
   const lines = [
     `model-router config: ${configPath}`,
     `configured mode: ${state.configuredMode}`,
@@ -3168,12 +3213,19 @@ function reportStatus(state: RuntimeState, configPath: string, ctx: ExtensionCom
   ];
   const models = state.config?.models;
   if (models) {
-    lines.push(`classifier model: ${models.classifier[0].provider}/${models.classifier[0].id}`);
-    lines.push(`weak model: ${models.weak[0].provider}/${models.weak[0].id}`);
+    lines.push("classifier pool:");
+    models.classifier.forEach((model, index) => lines.push(`  ${index + 1}. ${model.provider}/${model.id}`));
+    lines.push("weak pool:");
+    models.weak.forEach((model, index) => lines.push(`  ${index + 1}. ${model.provider}/${model.id}`));
   }
   if (state.config) {
+    lines.push(`classification timeout: ${state.config.classification.timeoutMs}ms`);
+    lines.push(`classification total timeout: ${state.config.classification.totalTimeoutMs}ms`);
     lines.push(`log directory: ${state.config.logging.directory}`);
     lines.push(`sub-pi: ${state.config.subPi.enabled ? "enabled" : "disabled"}`);
+  }
+  for (const entry of cooling) {
+    lines.push(`cooling: ${entry.role} ${entry.provider}/${entry.id} reason=${entry.reason} retryAfter=${new Date(entry.retryAfter).toISOString()}`);
   }
   if (state.effectiveState === "suspended") {
     lines.push(`suspended reason: ${state.suspendedReason ?? "required_pool_exhausted"}`);
@@ -3189,10 +3241,14 @@ function reportStatus(state: RuntimeState, configPath: string, ctx: ExtensionCom
     if (request.routeState !== "undecided") {
       lines.push(`route: ${request.routeState}`);
     }
+    const classification = request.classification;
+    if (classification.status !== "skipped" && classification.classifierModel) {
+      lines.push(`selected classifier: ${classification.classifierModel}`);
+    }
     if (request.targetModel) {
       lines.push(`target model: ${request.targetModel.provider}/${request.targetModel.id}`);
+      lines.push(`selected weak: ${request.targetModel.provider}/${request.targetModel.id}`);
     }
-
   }
   if (state.configResult.kind === "invalid") {
     lines.push(`config errors: ${state.configResult.errors.join("; ")}`);

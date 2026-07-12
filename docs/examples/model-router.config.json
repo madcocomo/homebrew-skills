@@ -18,7 +18,8 @@
     "minWeakConfidence": 0.9,
     "timeoutMs": 20000,
     "totalTimeoutMs": 30000,
-    "maxInputChars": 12000
+    "maxInputChars": 12000,
+    "maxContinuationResultChars": 6000
   },
   "limits": {
     "maxWeakContinuationTurns": 4,

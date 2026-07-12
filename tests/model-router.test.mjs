@@ -490,6 +490,7 @@ test("config: accepts complete off/shadow/active configs and applies documented 
     assert.equal(result.config.classification.timeoutMs, 20000);
     assert.equal(result.config.classification.totalTimeoutMs, 30000);
     assert.equal(result.config.classification.maxInputChars, 12000);
+    assert.equal(result.config.classification.maxContinuationResultChars, 6000);
     assert.equal(result.config.limits.maxWeakContinuationTurns, 4);
     assert.equal(result.config.limits.maxNoProgressTurns, 2);
     assert.equal(result.config.limits.maxRepeatedOperationCount, 2);
@@ -538,17 +539,29 @@ test("config: rejects empty, duplicate, and malformed model pool entries", async
   }
 });
 
-test("config: classification totalTimeoutMs defaults independently and validates its range", async () => {
+test("config: classification timeouts and continuation budget default independently and validate ranges", async () => {
   const explicit = await parseConfigWith(baseConfig({
-    classification: { timeoutMs: 5000, totalTimeoutMs: 25000 },
+    classification: {
+      timeoutMs: 5000,
+      totalTimeoutMs: 25000,
+      maxInputChars: 12000,
+      maxContinuationResultChars: 5000,
+    },
   }));
   assert.equal(explicit.kind, "valid", JSON.stringify(explicit.errors ?? []));
   assert.equal(explicit.config.classification.timeoutMs, 5000);
   assert.equal(explicit.config.classification.totalTimeoutMs, 25000);
+  assert.equal(explicit.config.classification.maxContinuationResultChars, 5000);
 
   for (const totalTimeoutMs of [0, 2.5, 600001]) {
     const result = await parseConfigWith(baseConfig({ classification: { totalTimeoutMs } }));
     assert.equal(result.kind, "invalid", `totalTimeoutMs=${totalTimeoutMs} should be invalid`);
+  }
+  for (const maxContinuationResultChars of [0, 1.5, 12001]) {
+    const result = await parseConfigWith(baseConfig({
+      classification: { maxInputChars: 12000, maxContinuationResultChars },
+    }));
+    assert.equal(result.kind, "invalid", `maxContinuationResultChars=${maxContinuationResultChars} should be invalid`);
   }
 });
 
@@ -1184,7 +1197,7 @@ async function admissionOf(overrides = {}) {
   });
 }
 
-test("admission: table-driven reason codes with fixed priority reject > strong > eligible", async () => {
+test("admission: table-driven reason codes with fixed priority reject > user > eligible", async () => {
   const module = await loadModelRouterModule();
 
   const eligible = await admissionOf();
@@ -1192,17 +1205,17 @@ test("admission: table-driven reason codes with fixed priority reject > strong >
   assert.deepEqual(eligible.reasonCodes, ["capsule_complete"]);
 
   const tooLarge = await admissionOf({ maxInputChars: 10 });
-  assert.equal(tooLarge.verdict, "strong");
+  assert.equal(tooLarge.verdict, "user");
   assert.ok(tooLarge.reasonCodes.includes("classifier_input_too_large"));
 
   const ambiguous = await admissionOf({ prompt: "just fix whatever is broken please" });
-  assert.equal(ambiguous.verdict, "strong");
+  assert.equal(ambiguous.verdict, "user");
   assert.ok(ambiguous.reasonCodes.includes("scope_ambiguous"));
 
   const noAcceptance = await admissionOf({
     prompt: FULL_TASK_PROMPT.split("\n").filter((l) => !/^verification:/i.test(l)).join("\n"),
   });
-  assert.equal(noAcceptance.verdict, "strong");
+  assert.equal(noAcceptance.verdict, "user");
   assert.ok(noAcceptance.reasonCodes.includes("acceptance_missing"));
 
   const invalidScope = await admissionOf({
@@ -1222,7 +1235,7 @@ test("admission: table-driven reason codes with fixed priority reject > strong >
   assert.ok(multi.reasonCodes.length >= 2, `expected >=2 reason codes, got ${multi.reasonCodes.length}: ${JSON.stringify(multi.reasonCodes)}`);
 });
 
-test("admission: edit/write/git/process restart do not trigger strong by themselves", async () => {
+test("admission: edit/write/git/process restart do not trigger user routing by themselves", async () => {
   const prompt = [
     "Objective: Update the config default and restart the dev process",
     "Allowed write: src/config.ts, tests/config.test.mjs",
@@ -1238,7 +1251,7 @@ test("admission: edit/write/git/process restart do not trigger strong by themsel
   assert.equal(result.verdict, "eligible", JSON.stringify(result));
 });
 
-test("admission: dangerous regression categories always strong even if classifier says weak", async () => {
+test("admission: dangerous regression categories always route user even if classifier says weak", async () => {
   const dangerous = [
     // 1. open-ended root cause analysis
     "Objective: Investigate the root cause of the intermittent CI failures\nAllowed write: src/a.ts\nSteps:\n1. investigate\nArtifacts: src/a.ts\nVerification: `node --test`",
@@ -1268,7 +1281,7 @@ test("admission: dangerous regression categories always strong even if classifie
   }
 });
 
-test("admission: cross-boundary write scope pushes strong", async () => {
+test("admission: cross-boundary write scope routes user", async () => {
   const prompt = [
     "Objective: Update the shared type in three places",
     "Allowed write: src/a.ts, lib/b.ts, tools/c.ts, docs/d.md",
@@ -1278,7 +1291,7 @@ test("admission: cross-boundary write scope pushes strong", async () => {
     "Verification: `node --test`",
   ].join("\n");
   const result = await admissionOf({ prompt });
-  assert.equal(result.verdict, "strong");
+  assert.equal(result.verdict, "user");
   assert.ok(result.reasonCodes.includes("cross_boundary_task"));
 });
 
@@ -1291,9 +1304,9 @@ test("admission: image matrix matches the design", async () => {
   const both = await admissionOf({ imageCount: 1 });
   assert.equal(both.verdict, "eligible");
 
-  // images, weak does not support -> strong (no intervention)
+  // images, weak does not support -> user (no downgrade)
   const weakNo = await admissionOf({ imageCount: 1, weakSupportsImages: false });
-  assert.equal(weakNo.verdict, "strong");
+  assert.equal(weakNo.verdict, "user");
   assert.ok(weakNo.reasonCodes.includes("image_not_supported_by_weak"));
 });
 
@@ -1302,7 +1315,7 @@ test("admission: image matrix matches the design", async () => {
 // ---------------------------------------------------------------------------
 
 const GOOD_CLASSIFIER_JSON = JSON.stringify({
-  protocolVersion: 1,
+  protocolVersion: 2,
   route: "weak",
   confidence: 0.96,
   riskFlags: [],
@@ -1336,25 +1349,89 @@ test("classifier protocol: input contains only the allowed compact fields", asyn
     Object.keys(input).sort(),
     [
       "protocolVersion",
+      "decisionKind",
       "requestId",
-      "promptExcerpt",
-      "cwd",
-      "imageMetadata",
-      "explicitPaths",
-      "explicitSteps",
-      "expectedArtifacts",
-      "verification",
+      "originalPromptExcerpt",
+      "currentObjective",
+      "currentPhase",
+      "toolCalls",
+      "toolResults",
+      "progress",
       "deterministicReasonCodes",
     ].sort(),
   );
-  assert.equal(input.protocolVersion, 1);
+  assert.equal(input.protocolVersion, 2);
+  assert.equal(input.decisionKind, "initial");
   assert.equal(input.requestId, "req-1");
-  assert.ok(input.promptExcerpt.length <= 40, "prompt excerpt must be bounded");
-  assert.deepEqual(input.imageMetadata, [{ mimeType: "image/png" }], "image binary must be stripped");
-  assert.equal(input.cwd, REPO);
-  assert.ok(Array.isArray(input.explicitPaths));
+  assert.ok(input.originalPromptExcerpt.length <= 40, "prompt excerpt must be bounded");
+  assert.deepEqual(input.toolCalls, []);
+  assert.deepEqual(input.toolResults, []);
   assert.deepEqual(input.deterministicReasonCodes, admission.reasonCodes);
   assert.ok(!JSON.stringify(input).includes("SHOULD-NOT-PASS"));
+});
+
+test("continuation input: excerpts are fairly bounded, redacted, and serialized within budget", async () => {
+  const module = await loadModelRouterModule();
+  const secretBlob = "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8S9t0";
+  const input = module.buildContinuationClassifierInput({
+    requestId: "req-continuation",
+    originalPrompt: "Fix the parser without logging AUTHORIZATION: Bearer top-secret-token",
+    currentObjective: "Fix parser",
+    currentPhase: "testing",
+    recentAssistantText: "I ran the tools",
+    tools: [
+      {
+        name: "bash",
+        input: { command: "node --test", apiKey: "do-not-copy-input-secrets" },
+        paths: ["/repo/tests/parser.test.mjs"],
+        isError: false,
+        exitCode: 0,
+        resultText: `Authorization: Bearer abc.def.ghi\nAPI_KEY=super-secret\n${"x".repeat(2400)}`,
+      },
+      {
+        name: "read",
+        input: { path: "/repo/src/parser.ts" },
+        paths: ["/repo/src/parser.ts"],
+        isError: false,
+        exitCode: null,
+        resultText: `-----BEGIN PRIVATE KEY-----\nprivate-material\n-----END PRIVATE KEY-----\n${secretBlob}\n${"y".repeat(2400)}`,
+      },
+    ],
+    progress: {
+      continuationIndex: 1,
+      noProgressCount: 0,
+      verificationSucceeded: true,
+      expectedArtifactsPresent: true,
+    },
+    deterministicReasonCodes: [],
+    maxContinuationResultChars: 2500,
+    maxInputChars: 4000,
+  });
+
+  assert.equal(input.protocolVersion, 2);
+  assert.equal(input.decisionKind, "continuation");
+  assert.equal(input.toolResults.length, 2);
+  assert.ok(input.toolResults.every((result) => result.excerpt.length <= 2000));
+  assert.ok(input.toolResults.reduce((sum, result) => sum + result.excerpt.length, 0) <= 2500);
+  assert.ok(input.toolResults.every((result) => result.truncated), "both oversized results get a fair share");
+  const serialized = JSON.stringify(input);
+  assert.ok(serialized.length <= 4000, `serialized length ${serialized.length}`);
+  for (const leak of ["top-secret-token", "super-secret", "private-material", secretBlob, "do-not-copy-input-secrets"]) {
+    assert.ok(!serialized.includes(leak), `classifier input must redact ${leak}`);
+  }
+});
+
+test("continuation input: redacts cloud credentials and common secret assignments", async () => {
+  const module = await loadModelRouterModule();
+  const redacted = module.redactClassifierText([
+    "AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE",
+    "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "password=hunter2-secret",
+    "access_token: token-value-123456789",
+  ].join("\n"));
+  for (const leak of ["AKIAIOSFODNN7EXAMPLE", "wJalrXUtnFEMI", "hunter2-secret", "token-value-123456789"]) {
+    assert.ok(!redacted.includes(leak), `redacted output must omit ${leak}`);
+  }
 });
 
 test("classifier protocol: only a bare single JSON object is accepted", async () => {
@@ -1376,13 +1453,14 @@ test("classifier protocol: only a bare single JSON object is accepted", async ()
     "null",
     "42",
     JSON.stringify({ ...JSON.parse(GOOD_CLASSIFIER_JSON), extra: 1 }),
-    JSON.stringify({ protocolVersion: 2, route: "weak", confidence: 0.9, riskFlags: [], reasonCode: "localized_explicit_task" }),
-    JSON.stringify({ protocolVersion: 1, route: "medium", confidence: 0.9, riskFlags: [], reasonCode: "localized_explicit_task" }),
-    JSON.stringify({ protocolVersion: 1, route: "weak", confidence: Number.NaN, riskFlags: [], reasonCode: "localized_explicit_task" }),
-    JSON.stringify({ protocolVersion: 1, route: "weak", confidence: 1.7, riskFlags: [], reasonCode: "localized_explicit_task" }),
-    JSON.stringify({ protocolVersion: 1, route: "weak", confidence: 0.9, riskFlags: ["made_up_flag"], reasonCode: "localized_explicit_task" }),
-    JSON.stringify({ protocolVersion: 1, route: "weak", confidence: 0.9, riskFlags: [], reasonCode: "free text explanation" }),
-    JSON.stringify({ protocolVersion: 1, route: "weak", confidence: 0.9, riskFlags: [] }),
+    JSON.stringify({ protocolVersion: 1, route: "weak", confidence: 0.9, riskFlags: [], reasonCode: "localized_explicit_task" }),
+    JSON.stringify({ protocolVersion: 2, route: ["str", "ong"].join(""), confidence: 0.9, riskFlags: [], reasonCode: "localized_explicit_task" }),
+    JSON.stringify({ protocolVersion: 2, route: "medium", confidence: 0.9, riskFlags: [], reasonCode: "localized_explicit_task" }),
+    JSON.stringify({ protocolVersion: 2, route: "weak", confidence: Number.NaN, riskFlags: [], reasonCode: "localized_explicit_task" }),
+    JSON.stringify({ protocolVersion: 2, route: "weak", confidence: 1.7, riskFlags: [], reasonCode: "localized_explicit_task" }),
+    JSON.stringify({ protocolVersion: 2, route: "weak", confidence: 0.9, riskFlags: ["made_up_flag"], reasonCode: "localized_explicit_task" }),
+    JSON.stringify({ protocolVersion: 2, route: "weak", confidence: 0.9, riskFlags: [], reasonCode: "free text explanation" }),
+    JSON.stringify({ protocolVersion: 2, route: "weak", confidence: 0.9, riskFlags: [] }),
   ];
   for (const [index, text] of badCases.entries()) {
     const result = module.parseClassifierResponse(text);
@@ -1397,7 +1475,7 @@ test("classifier combination: weak only with high confidence and no flags", asyn
   const ok = (overrides = {}) => ({
     status: "ok",
     classification: {
-      protocolVersion: 1,
+      protocolVersion: 2,
       route: "weak",
       confidence: 0.96,
       riskFlags: [],
@@ -1409,26 +1487,26 @@ test("classifier combination: weak only with high confidence and no flags", asyn
   const weak = module.combineRouteDecision(eligible, ok(), 0.9);
   assert.equal(weak.route, "weak");
 
-  const strongRoute = module.combineRouteDecision(eligible, ok({ route: "strong" }), 0.9);
-  assert.equal(strongRoute.route, "strong");
+  const userRoute = module.combineRouteDecision(eligible, ok({ route: "user" }), 0.9);
+  assert.equal(userRoute.route, "user");
 
   const lowConfidence = module.combineRouteDecision(eligible, ok({ confidence: 0.5 }), 0.9);
-  assert.equal(lowConfidence.route, "strong");
+  assert.equal(lowConfidence.route, "user");
 
   const flagged = module.combineRouteDecision(eligible, ok({ riskFlags: ["sensitive"] }), 0.9);
-  assert.equal(flagged.route, "strong");
+  assert.equal(flagged.route, "user");
 
   const failed = module.combineRouteDecision(eligible, { status: "failed", code: "classifier_timeout" }, 0.9);
-  assert.equal(failed.route, "strong");
+  assert.equal(failed.route, "user");
   assert.ok(failed.reasonCodes.includes("classifier_failure"));
 
   // deterministic verdicts are never overridden by the classifier
   const hardStrong = module.combineRouteDecision(
-    { verdict: "strong", reasonCodes: ["sensitive_or_irreversible"] },
+    { verdict: "user", reasonCodes: ["sensitive_or_irreversible"] },
     ok(),
     0.9,
   );
-  assert.equal(hardStrong.route, "strong");
+  assert.equal(hardStrong.route, "user");
   assert.deepEqual(hardStrong.reasonCodes, ["sensitive_or_irreversible"]);
 
   const rejected = module.combineRouteDecision(
@@ -1526,9 +1604,9 @@ test("classifier fallback: resolution not-found/auth failures continue without c
   assert.deepEqual(authCalls, ["classifier-2"]);
 });
 
-test("classifier fallback: valid strong, low-confidence, and risk result stop without voting or cooldown", async () => {
+test("classifier fallback: valid user, low-confidence, and risk result stop without voting or cooldown", async () => {
   const validResults = [
-    { route: "strong" },
+    { route: "user" },
     { confidence: 0.2 },
     { riskFlags: ["sensitive"] },
   ];
@@ -1601,7 +1679,7 @@ function shadowFiles(mode = "shadow", extra = {}) {
 
 function classifierText(overrides = {}) {
   return JSON.stringify({
-    protocolVersion: 1,
+    protocolVersion: 2,
     route: "weak",
     confidence: 0.96,
     riskFlags: [],
@@ -1685,7 +1763,7 @@ test("shadow: initial decision resets request state, classifies once, never call
   const records = readLogRecords(harness);
   assert.equal(records.length, 1);
   const record = records[0];
-  assert.equal(record.schemaVersion, 1);
+  assert.equal(record.schemaVersion, 2);
   assert.equal(record.mode, "shadow");
   assert.equal(record.decisionKind, "initial");
   assert.equal(record.targetModel, "opencode/mimo-v2.5-free");
@@ -1695,12 +1773,12 @@ test("shadow: initial decision resets request state, classifies once, never call
   assert.equal(record.classification.status, "ok");
 });
 
-test("shadow: hard strong target skips classifier entirely; reject also logged", async () => {
+test("shadow: hard user target skips classifier entirely; reject also logged", async () => {
   const { harness } = await setupShadow();
   await emitStart(harness, "please just fix whatever seems broken");
   assert.equal(harness.classifierCalls.length, 0);
   let records = readLogRecords(harness);
-  assert.equal(records.at(-1).targetModel, null, "strong verdict means no target model");
+  assert.equal(records.at(-1).targetModel, null, "user verdict means no weak target model");
   assert.equal(harness.setModelCalls.length, 0);
 
   await emitStart(harness, FULL_TASK_PROMPT.replace("src/utils/date.ts,", "../escape.ts,"));
@@ -1710,7 +1788,7 @@ test("shadow: hard strong target skips classifier entirely; reject also logged",
   assert.equal(harness.classifierCalls.length, 0);
 });
 
-test("shadow: tool observers never block or rewrite; continuation shares requestId without reclassifying", async () => {
+test("shadow: tool observers never block or rewrite; continuation gets fresh bounded classification", async () => {
   const { harness } = await setupShadow();
   await emitStart(harness);
   const callResults = await harness.emit("tool_call", {
@@ -1725,7 +1803,7 @@ test("shadow: tool observers never block or rewrite; continuation shares request
     toolCallId: "t1",
     toolName: "read",
     input: { path: `${REPO}/src/utils/date.ts` },
-    content: [{ type: "text", text: "the file contents SECRET-CONTENT" }],
+    content: [{ type: "text", text: "the file contents API_KEY=SECRET-CONTENT" }],
     isError: false,
   });
   assert.ok(resultResults.every((r) => r === undefined), "must not rewrite results");
@@ -1739,7 +1817,38 @@ test("shadow: tool observers never block or rewrite; continuation shares request
   assert.equal(continuation.actualModel, "anthropic/claude-opus-4-6");
   assert.deepEqual(continuation.actualUsage, { input: 100, output: 20 });
   assert.equal(continuation.toolSummary.count, 1);
-  assert.equal(harness.classifierCalls.length, 1, "continuation must not re-classify");
+  assert.equal(harness.classifierCalls.length, 2, "continuation must re-classify");
+  const continuationInput = harness.classifierCalls[1].request.input;
+  assert.equal(continuationInput.decisionKind, "continuation");
+  assert.ok(continuationInput.toolResults[0].excerpt.includes("the file contents"));
+  assert.ok(!JSON.stringify(continuationInput).includes("SECRET-CONTENT"), "high-entropy result marker is redacted");
+  assert.equal(harness.setModelCalls.length, 0);
+});
+
+test("shadow: schema 2 records independent continuation routes and evidence metadata without switching", async () => {
+  const routes = ["weak", "user"];
+  const { harness } = await setupShadow({}, {
+    classify: async (request) => {
+      harness.classifierCalls.push({ request, seq: harness.nextSeq() });
+      return { text: classifierText({ route: routes.shift() }) };
+    },
+  });
+  await emitStart(harness);
+  await emitToolPair(harness, {
+    id: "schema-two",
+    toolName: "edit",
+    input: { path: `${REPO}/src/utils/date.ts`, oldText: "a", newText: "b" },
+    text: `result evidence ${"z".repeat(2500)}`,
+  });
+  await emitTurnEnd(harness, { toolResultIds: ["schema-two"] });
+
+  const records = readLogRecords(harness);
+  assert.deepEqual(records.map((record) => record.schemaVersion), [2, 2]);
+  assert.deepEqual(records.map((record) => record.route), ["weak", "user"]);
+  assert.equal(records[1].classification.route, "user");
+  assert.ok(records[1].classifierInputChars > 0);
+  assert.ok(records[1].resultExcerptChars > 0);
+  assert.equal(records[1].excerptsTruncated, true);
   assert.equal(harness.setModelCalls.length, 0);
 });
 
@@ -2033,7 +2142,7 @@ async function setupActive(harnessOptions = {}, depsOptions = {}) {
 function strongClassifier(harness) {
   return async (request) => {
     harness.classifierCalls.push({ request, seq: harness.nextSeq() });
-    return { text: classifierText({ route: "strong" }) };
+    return { text: classifierText({ route: "user" }) };
   };
 }
 
@@ -2056,7 +2165,7 @@ test("active initial: weak route calls setModel(fixedWeak) before provider reque
     "setModel must happen before provider request, got index setModel=" + setModelIdx + " req=" + reqIdx);
 });
 
-test("active initial: hard strong/classifier failure does not call setModel (no intervention)", async () => {
+test("active initial: hard user/classifier failure does not call setModel (no intervention)", async () => {
   const harness = await setupActive({}, { classify: async () => { throw new Error("classifier fail"); } });
   await harness.emit("before_agent_start", {
     type: "before_agent_start",
@@ -2064,7 +2173,7 @@ test("active initial: hard strong/classifier failure does not call setModel (no 
     systemPrompt: "",
     systemPromptOptions: {},
   });
-  // classifier fails → strong verdict → no intervention, no setModel
+  // classifier fails → user verdict → no intervention, no setModel
   assert.equal(harness.setModelCalls.length, 0);
 });
 
@@ -2080,7 +2189,7 @@ test("active initial: hard rule prompt (scope ambiguous) does not call setModel 
   assert.equal(harness.classifierCalls.length, 0);
 });
 
-test("active strong verdict after a weak request restores the user model before no-op", async () => {
+test("active user verdict after a weak request restores the user model before no-op", async () => {
   const returnModel = fakeModel("user", "selected-before-weak", ["text", "image"]);
   const harness = await setupActive({ currentModel: returnModel });
 
@@ -2090,7 +2199,7 @@ test("active strong verdict after a weak request restores the user model before 
   await emitStart(harness, "just fix whatever is broken thanks");
   assert.equal(harness.setModelCalls.length, 2, "second request should only restore the prior lease");
   assert.strictEqual(harness.setModelCalls.at(-1).model, returnModel);
-  assert.strictEqual(harness.ctx.model, returnModel, "strong verdict must continue on the restored user model");
+  assert.strictEqual(harness.ctx.model, returnModel, "user verdict must continue on the restored user model");
 });
 
 test("active initial: weak setModel false keeps the exact current model with no fallback", async () => {
@@ -2282,19 +2391,123 @@ test("active initial: shadow does not inject capsule message", async () => {
   assert.equal(harness.sentMessages.length, 0, "shadow must not inject capsule message");
 });
 
-test("weak lease: healthy continuation keeps weak without setModel re-call", async () => {
-  const harness = await setupActive();
+test("continuation: independently switches exact user/weak/user/weak before provider requests", async () => {
+  const userModel = fakeModel("user", "exact-selected-model", ["text", "image"]);
+  const routes = ["user", "weak", "user", "weak"];
+  const harness = await setupActive({ currentModel: userModel }, {
+    classify: async (request) => {
+      harness.classifierCalls.push({ request, seq: harness.nextSeq() });
+      return { text: classifierText({ route: routes.shift() }) };
+    },
+  });
+
   await emitStart(harness);
-  const setModelBefore = harness.setModelCalls.length;
+  harness.fs.files.set(`${REPO}/tests/date.test.mjs`, "test fixture");
+  assert.strictEqual(harness.ctx.model, userModel, "initial user route is a no-op");
+  const transitionTools = [
+    { toolName: "edit", input: { path: `${REPO}/tests/date.test.mjs`, oldText: "a", newText: "b" } },
+    { toolName: "edit", input: { path: `${REPO}/src/utils/date.ts`, oldText: "a", newText: "b" } },
+    { toolName: "bash", input: { command: "node --test tests/date.test.mjs" } },
+  ];
+  for (let index = 1; index <= 3; index += 1) {
+    await emitToolPair(harness, {
+      id: `transition-${index}`,
+      ...transitionTools[index - 1],
+      text: `result ${index}`,
+    });
+    await emitTurnEnd(harness, { turnIndex: index, toolResultIds: [`transition-${index}`] });
+    const providerRequest = harness.markProviderRequest();
+    const latestSwitch = harness.setModelCalls.at(-1);
+    if (latestSwitch) assert.ok(latestSwitch.seq < providerRequest.seq);
+  }
+
+  assert.equal(harness.classifierCalls.length, 4);
+  assert.deepEqual(harness.setModelCalls.map((call) => `${call.provider}/${call.id}`), [
+    "opencode/mimo-v2.5-free",
+    "user/exact-selected-model",
+    "opencode/mimo-v2.5-free",
+  ]);
+  assert.strictEqual(harness.setModelCalls[1].model, userModel, "restoration uses the exact captured object");
+});
+
+test("continuation: ambiguous initial prompt does not suppress later classification", async () => {
+  const harness = await setupActive();
+  await emitStart(harness, "please fix whatever is broken");
+  assert.equal(harness.classifierCalls.length, 0);
   await emitToolPair(harness, {
-    id: "t1",
+    id: "ambiguous-continuation",
     toolName: "read",
     input: { path: `${REPO}/src/utils/date.ts` },
-    text: "content",
+    text: "useful result",
   });
-  await emitTurnEnd(harness, { toolResultIds: ["t1"] });
-  // Healthy continuation should NOT trigger another setModel
-  assert.equal(harness.setModelCalls.length, setModelBefore, "healthy continuation must not switch model");
+  await emitTurnEnd(harness, { toolResultIds: ["ambiguous-continuation"] });
+  assert.equal(harness.classifierCalls.length, 1);
+  assert.equal(harness.classifierCalls[0].request.input.decisionKind, "continuation");
+});
+
+test("continuation safety: failed boundary restores user and later progress can classify weak again", async () => {
+  const userModel = fakeModel("user", "boundary-user", ["text", "image"]);
+  const harness = await setupActive({ currentModel: userModel });
+  await emitStart(harness);
+  assert.equal(harness.ctx.model.id, "mimo-v2.5-free");
+  const callsAfterInitial = harness.classifierCalls.length;
+
+  await emitToolPair(harness, {
+    id: "failed-boundary",
+    toolName: "bash",
+    input: { command: "node --test tests/date.test.mjs" },
+    isError: true,
+    details: { exitCode: 1 },
+    text: "failed",
+  });
+  await emitTurnEnd(harness, { toolResultIds: ["failed-boundary"] });
+  assert.strictEqual(harness.ctx.model, userModel);
+  assert.equal(harness.classifierCalls.length, callsAfterInitial, "hard-user boundary skips classifier");
+
+  await emitToolPair(harness, {
+    id: "safe-boundary",
+    toolName: "edit",
+    input: { path: `${REPO}/src/utils/date.ts`, oldText: "bad", newText: "good" },
+    text: "updated",
+  });
+  await emitTurnEnd(harness, { turnIndex: 1, toolResultIds: ["safe-boundary"] });
+  assert.equal(harness.classifierCalls.length, callsAfterInitial + 1);
+  assert.equal(harness.ctx.model.id, "mimo-v2.5-free");
+});
+
+test("continuation safety: weak context incompatibility routes user without classifier", async () => {
+  const userModel = fakeModel("user", "large-context-user", ["text", "image"]);
+  const tinyWeak = { ...fakeModel("test", "tiny-weak"), contextWindow: 1024 };
+  const harness = createHarness({
+    currentModel: userModel,
+    cwd: REPO,
+    registryModels: [fakeModel("test", "classifier-1"), tinyWeak],
+  });
+  await setupExtension(harness, {
+    files: { [CONFIG_PATH]: JSON.stringify(baseConfig({
+      mode: "active",
+      models: {
+        classifier: { provider: "test", id: "classifier-1", supportsImages: false },
+        weak: { provider: "test", id: "tiny-weak", supportsImages: false },
+      },
+    })) },
+    classify: weakClassifier(harness),
+  });
+  await emitStart(harness);
+  const callsAfterInitial = harness.classifierCalls.length;
+  await emitToolPair(harness, {
+    id: "context-boundary",
+    toolName: "edit",
+    input: { path: `${REPO}/src/utils/date.ts`, oldText: "a", newText: "b" },
+    text: "done",
+  });
+  await emitTurnEnd(harness, {
+    toolResultIds: ["context-boundary"],
+    usage: { input: 900, output: 100 },
+  });
+  assert.equal(harness.classifierCalls.length, callsAfterInitial);
+  assert.strictEqual(harness.ctx.model, userModel);
+  assert.ok(readLogRecords(harness).at(-1).reasonCodes.includes("weak_context_incompatible"));
 });
 
 test("weak lease: any turn_end effect signal restores the exact return model before the next request", async () => {
@@ -2555,7 +2768,7 @@ test("/routing: off waits for idle, restores activation, clears all routing stat
 });
 
 test("/routing: restore failure marks restore-error, no fallback", async () => {
-  // Setup: activation is strong, but setModel for it will fail
+  // Setup: activation is the user model, but setModel for it will fail
   const harness = createHarness({
     registryModels: FIXED_MODELS,
     cwd: REPO,
@@ -2587,7 +2800,7 @@ test("/routing: status displays config path, modes, snapshot, lease", async () =
   assert.ok(text.includes("target model") || text.includes("opencode/mimo"), "target");
   assert.match(text, /classifier pool:\s*1\. opencode\/deepseek-v4-flash-free/s);
   assert.match(text, /weak pool:\s*1\. opencode\/mimo-v2.5-free/s);
-  assert.ok(!/strong model/.test(text), "strong model line removed");
+  assert.match(text, /activation model:/i, "status identifies the captured activation model");
   assert.match(text, /log directory:/);
   assert.match(text, /sub-pi: disabled/);
 });
@@ -2645,7 +2858,8 @@ test("audit: fallback metadata uses exact allowlist and excludes provider/prompt
   const record = readLogRecords(harness).at(-1);
   const allowed = new Set([
     "schemaVersion", "timestamp", "mode", "sessionId", "requestId", "turnIndex",
-    "decisionKind", "admission", "classification", "targetModel", "actualModel",
+    "decisionKind", "admission", "classification", "route", "classifierInputChars",
+    "resultExcerptChars", "excerptsTruncated", "targetModel", "actualModel",
     "reasonCodes", "toolSummary", "providerLatencyMs", "actualUsage",
     "expectedAcceptanceHit", "selectedClassifier", "selectedWeak", "fallbackCount",
     "failureCodes",
@@ -2749,9 +2963,9 @@ test("/routing review shows no audit data when router is off", async () => {
   assert.ok(text.includes("no audit data"), "off router: " + text);
 });
 
-test("/routing review shows summary with all strong entries", async () => {
+test("/routing review normalizes schema-1 strong entries as user routes", async () => {
   const harness = await setupForReview({
-    dir: "/tmp/sr-strong", mode: "shadow",
+    dir: "/tmp/sr-legacy-user", mode: "shadow",
     auditData: [
       entry({ requestId: "req-001" }),
       entry({ requestId: "req-001", turnIndex: 1 }),
@@ -2761,7 +2975,7 @@ test("/routing review shows summary with all strong entries", async () => {
   await harness.runCommand("routing", "review");
   const text = harness.notifications.map((n) => n.message).join("\n");
   assert.ok(text.includes("Total records: 3"), "count: " + text);
-  assert.ok(/strong\s+2/.test(text), "strong: " + text);
+  assert.ok(/user\s+2/.test(text), "user: " + text);
   assert.ok(/reject\s+1/.test(text), "reject: " + text);
   assert.ok(/eligible\s+0/.test(text), "eligible: " + text);
   assert.ok(text.includes("(would have switched to weak): 0"), "weak0: " + text);
@@ -2815,7 +3029,7 @@ test("integration: full shadow lifecycle has consistent request ids and zero set
   assert.equal(records.length, 2, "initial + continuation");
   assert.equal(records[0].requestId, records[1].requestId, "same request id");
   assert.equal(harness.setModelCalls.length, 0, "shadow must not call setModel");
-  assert.equal(harness.classifierCalls.length, 1, "one classifier call");
+  assert.equal(harness.classifierCalls.length, 2, "initial and continuation classifier calls");
 });
 
 test("integration: full active lifecycle keeps a healthy lease and releases it on error", async () => {
@@ -3521,7 +3735,7 @@ test("production classifier adapter calls complete with strict compact prompt", 
       timestamp: Date.now(),
     };
   });
-  const input = { protocolVersion: 1, requestId: "req-1", promptExcerpt: "bounded", cwd: REPO };
+  const input = { protocolVersion: 2, decisionKind: "initial", requestId: "req-1", originalPromptExcerpt: "bounded" };
   const response = await classify({
     input,
     model: fakeModel("opencode", "deepseek-v4-flash-free"),
@@ -3576,7 +3790,7 @@ test("session shutdown restores the activation model after an active weak route"
 test("active image request unsupported by weak leaves the current model unchanged", async () => {
   const config = baseConfig({ mode: "active" });
   config.models.weak.supportsImages = false;
-  // images + weakSupportsImages=false → strong verdict (no intervention), not abort
+  // images + weakSupportsImages=false → user verdict (no downgrade), not abort
   const harness = createHarness({ registryModels: FIXED_MODELS, cwd: REPO });
   await setupExtension(harness, {
     files: { [CONFIG_PATH]: JSON.stringify(config) },

@@ -5,7 +5,7 @@
  * - Classifier + weak model identities are fixed by configuration; no candidate discovery.
  * - Shadow mode never calls pi.setModel(); active mode only downgrades to
  *   the configured weak model when the classifier deems the task simple enough.
- * - "Strong verdict" means do not intervene — let the user's current model continue.
+ * - A user route keeps or restores the exact model selected for the agent run.
  *
  * See docs/pi-model-routing-design.md for the full design.
  */
@@ -89,10 +89,10 @@ interface ProductionClassifierRequest {
 const CLASSIFIER_SYSTEM_PROMPT = [
   "You are a conservative task router.",
   "Return exactly one JSON object and no markdown or explanatory text.",
-  'The exact shape is {"protocolVersion":1,"route":"weak|strong","confidence":0.0,"riskFlags":[],"reasonCode":"..."}.',
+  'The exact shape is {"protocolVersion":2,"route":"weak|user","confidence":0.0,"riskFlags":[],"reasonCode":"..."}.',
   "riskFlags may contain only ambiguous_scope, cross_module, long_horizon, sensitive, image_uncertain, acceptance_uncertain.",
   "reasonCode must be one of localized_explicit_task, broad_task, uncertain_scope, high_risk, other.",
-  "Choose weak only for a localized task whose supplied capsule is complete; otherwise choose strong.",
+  "Choose weak only for a localized task whose supplied evidence is sufficient; otherwise choose user.",
 ].join(" ");
 
 /** Production adapter for the fixed classifier model. */
@@ -160,6 +160,7 @@ export interface ResolvedRouterConfig {
     timeoutMs: number;
     totalTimeoutMs: number;
     maxInputChars: number;
+    maxContinuationResultChars: number;
   };
   limits: {
     maxWeakContinuationTurns: number;
@@ -194,6 +195,7 @@ export function getDefaultConfigPath(agentDir: string): string {
 const BOUNDS = {
   classificationTimeoutMs: { min: 1, max: 600_000 },
   maxInputChars: { min: 1, max: 1_000_000 },
+  maxContinuationResultChars: { min: 1, max: 1_000_000 },
   turnOrCount: { min: 1, max: 1_000 },
   maxReasonChars: { min: 1, max: 10_000 },
   subPiTimeoutMs: { min: 1, max: 86_400_000 },
@@ -360,6 +362,7 @@ export function parseModelRouterConfig(
     timeoutMs: 20_000,
     totalTimeoutMs: 30_000,
     maxInputChars: 12_000,
+    maxContinuationResultChars: 6_000,
   };
   if (record.classification !== undefined) {
     const path = "config.classification";
@@ -367,7 +370,14 @@ export function parseModelRouterConfig(
       checkExactKeys(
         record.classification,
         path,
-        ["ruleProfile", "minWeakConfidence", "timeoutMs", "totalTimeoutMs", "maxInputChars"],
+        [
+          "ruleProfile",
+          "minWeakConfidence",
+          "timeoutMs",
+          "totalTimeoutMs",
+          "maxInputChars",
+          "maxContinuationResultChars",
+        ],
         errors,
       )
     ) {
@@ -395,6 +405,18 @@ export function parseModelRouterConfig(
       if (c.maxInputChars !== undefined) {
         const v = checkIntInRange(c.maxInputChars, `${path}.maxInputChars`, BOUNDS.maxInputChars, errors);
         if (v !== undefined) classification.maxInputChars = v;
+      }
+      if (c.maxContinuationResultChars !== undefined) {
+        const v = checkIntInRange(
+          c.maxContinuationResultChars,
+          `${path}.maxContinuationResultChars`,
+          BOUNDS.maxContinuationResultChars,
+          errors,
+        );
+        if (v !== undefined) classification.maxContinuationResultChars = v;
+      }
+      if (classification.maxContinuationResultChars > classification.maxInputChars) {
+        errors.push(`${path}.maxContinuationResultChars: must not exceed maxInputChars`);
       }
     }
   }
@@ -816,7 +838,7 @@ function looksLikePath(token: string): boolean {
 
 /**
  * Build a capsule from explicit facts only. Any uncertainty tightens scope or
- * pushes the request toward strong; nothing is guessed.
+ * pushes the request toward the user model; nothing is guessed.
  */
 export function buildTaskCapsule(prompt: string, ctx: CapsuleContext): CapsuleResult {
   const facts = extractExplicitFacts(prompt);
@@ -884,7 +906,7 @@ export function buildTaskCapsule(prompt: string, ctx: CapsuleContext): CapsuleRe
 // Deterministic admission (design section 10 / conservative-v1 profile)
 // ---------------------------------------------------------------------------
 
-export type AdmissionVerdict = "eligible" | "strong" | "reject";
+export type AdmissionVerdict = "eligible" | "user" | "reject";
 
 export interface AdmissionInput {
   prompt: string;
@@ -900,7 +922,7 @@ export interface Admission {
   capsule?: TaskCapsule;
 }
 
-// conservative-v1 hard-rule detectors. These only push toward strong/reject.
+// conservative-v1 hard-rule detectors. These only push toward user/reject.
 const BROAD_ANALYSIS_PATTERN =
   /root cause|architecture|re-?design|re-?architect|open-ended|investigate why|investigate the|audit the entire|根因|架构|开放式|全面(分析|排查)|排查.*(原因|问题)/i;
 const CROSS_BOUNDARY_PATTERN =
@@ -929,62 +951,62 @@ function topLevelSegments(paths: string[], repositoryRoot: string): Set<string> 
 
 /**
  * Deterministic admission ahead of any classifier call. Rules may only make
- * the outcome more conservative; priority is reject > strong > eligible.
+ * the outcome more conservative; priority is reject > user > eligible.
  */
 export function evaluateAdmission(input: AdmissionInput): Admission {
   const reject = new Set<string>();
-  const strong = new Set<string>();
+  const hardUser = new Set<string>();
 
   const hasImages = input.imageCount > 0;
   if (hasImages) {
     if (!input.weakSupportsImages) {
-      strong.add("image_not_supported_by_weak");
+      hardUser.add("image_not_supported_by_weak");
     }
   }
 
-  if (input.prompt.length > input.maxInputChars) strong.add("classifier_input_too_large");
+  if (input.prompt.length > input.maxInputChars) hardUser.add("classifier_input_too_large");
 
   const capsule = input.capsule;
   if (capsule.status === "invalid_scope") {
     reject.add("invalid_capsule_scope");
   } else if (capsule.status === "ambiguous") {
-    strong.add("scope_ambiguous");
+    hardUser.add("scope_ambiguous");
   } else if (capsule.status === "incomplete") {
     for (const reason of capsule.reasons) {
       if (reason.includes("artifacts") || reason.includes("verification")) {
-        strong.add("acceptance_missing");
+        hardUser.add("acceptance_missing");
       } else if (reason.includes("conflict")) {
-        strong.add("intent_ambiguous");
+        hardUser.add("intent_ambiguous");
       } else {
-        strong.add("scope_ambiguous");
+        hardUser.add("scope_ambiguous");
       }
     }
   }
 
-  if (BROAD_ANALYSIS_PATTERN.test(input.prompt)) strong.add("broad_analysis_or_design");
-  if (CROSS_BOUNDARY_PATTERN.test(input.prompt)) strong.add("cross_boundary_task");
-  if (LONG_HORIZON_PATTERN.test(input.prompt)) strong.add("long_horizon_consistency");
-  if (INTENT_AMBIGUOUS_PATTERN.test(input.prompt)) strong.add("intent_ambiguous");
-  if (SENSITIVE_PATTERN.test(input.prompt)) strong.add("sensitive_or_irreversible");
+  if (BROAD_ANALYSIS_PATTERN.test(input.prompt)) hardUser.add("broad_analysis_or_design");
+  if (CROSS_BOUNDARY_PATTERN.test(input.prompt)) hardUser.add("cross_boundary_task");
+  if (LONG_HORIZON_PATTERN.test(input.prompt)) hardUser.add("long_horizon_consistency");
+  if (INTENT_AMBIGUOUS_PATTERN.test(input.prompt)) hardUser.add("intent_ambiguous");
+  if (SENSITIVE_PATTERN.test(input.prompt)) hardUser.add("sensitive_or_irreversible");
 
   if (capsule.status === "complete") {
     const segments = topLevelSegments(
       [...capsule.capsule.allowedWrite],
       capsule.capsule.repositoryRoot,
     );
-    if (segments.size > CROSS_BOUNDARY_MAX_TOP_LEVEL_DIRS) strong.add("cross_boundary_task");
-    if (capsule.capsule.steps.length > LONG_HORIZON_MAX_STEPS) strong.add("long_horizon_consistency");
+    if (segments.size > CROSS_BOUNDARY_MAX_TOP_LEVEL_DIRS) hardUser.add("cross_boundary_task");
+    if (capsule.capsule.steps.length > LONG_HORIZON_MAX_STEPS) hardUser.add("long_horizon_consistency");
   }
 
   if (reject.size > 0) {
-    return { verdict: "reject", reasonCodes: [...reject, ...strong].sort() };
+    return { verdict: "reject", reasonCodes: [...reject, ...hardUser].sort() };
   }
-  if (strong.size > 0) {
-    return { verdict: "strong", reasonCodes: [...strong].sort() };
+  if (hardUser.size > 0) {
+    return { verdict: "user", reasonCodes: [...hardUser].sort() };
   }
   if (capsule.status !== "complete") {
     // Defensive: never eligible without a complete capsule.
-    return { verdict: "strong", reasonCodes: ["scope_ambiguous"] };
+    return { verdict: "user", reasonCodes: ["scope_ambiguous"] };
   }
   return { verdict: "eligible", reasonCodes: ["capsule_complete"], capsule: capsule.capsule };
 }
@@ -1011,21 +1033,33 @@ export const CLASSIFIER_REASON_CODES = [
 ] as const;
 
 export interface ClassifierInput {
-  protocolVersion: 1;
+  protocolVersion: 2;
+  decisionKind: "initial" | "continuation";
   requestId: string;
-  promptExcerpt: string;
-  cwd: string;
-  imageMetadata: Array<{ mimeType: string }>;
-  explicitPaths: string[];
-  explicitSteps: string[];
-  expectedArtifacts: string[];
-  verification: string[];
+  originalPromptExcerpt: string;
+  currentObjective?: string;
+  currentPhase?: string;
+  recentAssistantText?: string;
+  toolCalls: Array<{ name: string; inputSummary: unknown; paths: string[] }>;
+  toolResults: Array<{
+    name: string;
+    isError: boolean;
+    exitCode: number | null;
+    excerpt: string;
+    truncated: boolean;
+  }>;
+  progress: {
+    continuationIndex: number;
+    noProgressCount: number;
+    verificationSucceeded: boolean;
+    expectedArtifactsPresent: boolean | null;
+  };
   deterministicReasonCodes: string[];
 }
 
 export interface ClassifierResult {
-  protocolVersion: 1;
-  route: "weak" | "strong";
+  protocolVersion: 2;
+  route: "weak" | "user";
   confidence: number;
   riskFlags: string[];
   reasonCode: string;
@@ -1043,6 +1077,9 @@ export type Classification =
       classifierModel?: string;
       attemptCount?: number;
       failureCodes?: string[];
+      inputChars?: number;
+      resultExcerptChars?: number;
+      excerptsTruncated?: boolean;
     }
   | {
       status: "failed";
@@ -1050,12 +1087,121 @@ export type Classification =
       classifierModel?: string;
       attemptCount?: number;
       failureCodes?: string[];
+      inputChars?: number;
+      resultExcerptChars?: number;
+      excerptsTruncated?: boolean;
     };
 
-/**
- * Build the compact classification record. Never includes image binaries,
- * env vars, auth data, history or tool output.
- */
+const MAX_TOOL_RESULT_EXCERPT_CHARS = 2_000;
+const REDACTED = "[REDACTED]";
+
+/** Heuristically remove common credential forms before classifier transmission. */
+export function redactClassifierText(text: string): string {
+  return text
+    .replace(/-----BEGIN(?: [A-Z]+)* PRIVATE KEY-----[\s\S]*?-----END(?: [A-Z]+)* PRIVATE KEY-----/gi, REDACTED)
+    .replace(/\b(?:authorization\s*:\s*)?(?:bearer|basic)\s+[A-Za-z0-9._~+/=-]+/gi, REDACTED)
+    .replace(/\bAKIA[0-9A-Z]{16}\b/g, REDACTED)
+    .replace(/\b(?:api[_-]?key|access[_-]?token|auth[_-]?token|secret(?:[_-]?access)?[_-]?key|password|passwd|client[_-]?secret)\s*[:=]\s*[^\s,;]+/gi, REDACTED)
+    .replace(/\b(?=[A-Za-z0-9+/=_-]{32,}\b)(?=[A-Za-z0-9+/=_-]*[A-Z])(?=[A-Za-z0-9+/=_-]*[a-z])(?=[A-Za-z0-9+/=_-]*\d)[A-Za-z0-9+/=_-]+\b/g, REDACTED);
+}
+
+function summarizeToolInput(input: Record<string, unknown>): unknown {
+  const summary: Record<string, unknown> = { keys: Object.keys(input).sort() };
+  if (typeof input.command === "string") {
+    summary.command = redactClassifierText(input.command).slice(0, 500);
+  }
+  return summary;
+}
+
+function fairExcerptLimits(count: number, budget: number): number[] {
+  if (count === 0) return [];
+  const cappedBudget = Math.max(0, Math.min(budget, count * MAX_TOOL_RESULT_EXCERPT_CHARS));
+  const base = Math.floor(cappedBudget / count);
+  let remainder = cappedBudget - base * count;
+  return Array.from({ length: count }, () => {
+    const limit = Math.min(MAX_TOOL_RESULT_EXCERPT_CHARS, base + (remainder > 0 ? 1 : 0));
+    if (remainder > 0) remainder -= 1;
+    return limit;
+  });
+}
+
+function enforceSerializedInputLimit(input: ClassifierInput, maxInputChars: number): ClassifierInput {
+  const serializedLength = () => JSON.stringify(input).length;
+  while (serializedLength() > maxInputChars) {
+    const longest = input.toolResults.reduce(
+      (best, result, index) => result.excerpt.length > best.length ? { index, length: result.excerpt.length } : best,
+      { index: -1, length: 0 },
+    );
+    if (longest.index < 0 || longest.length === 0) break;
+    const excess = serializedLength() - maxInputChars;
+    const result = input.toolResults[longest.index];
+    result.excerpt = result.excerpt.slice(0, Math.max(0, result.excerpt.length - excess - 8));
+    result.truncated = true;
+  }
+  for (const key of ["recentAssistantText", "originalPromptExcerpt", "currentPhase", "currentObjective"] as const) {
+    while (serializedLength() > maxInputChars && input[key]) {
+      const value = input[key] as string;
+      const excess = serializedLength() - maxInputChars;
+      input[key] = value.slice(0, Math.max(0, value.length - excess - 8)) as never;
+    }
+  }
+  return input;
+}
+
+/** Build bounded, redacted evidence for the provider request after a tool batch. */
+export function buildContinuationClassifierInput(options: {
+  requestId: string;
+  originalPrompt: string;
+  currentObjective?: string;
+  currentPhase?: string;
+  recentAssistantText?: string;
+  tools: Array<{
+    name: string;
+    input: Record<string, unknown>;
+    paths: string[];
+    isError: boolean;
+    exitCode: number | null;
+    resultText: string;
+    resultTruncated?: boolean;
+  }>;
+  progress: ClassifierInput["progress"];
+  deterministicReasonCodes: string[];
+  maxContinuationResultChars: number;
+  maxInputChars: number;
+}): ClassifierInput {
+  const limits = fairExcerptLimits(options.tools.length, options.maxContinuationResultChars);
+  const toolResults = options.tools.map((tool, index) => {
+    const redacted = redactClassifierText(tool.resultText);
+    const limit = limits[index] ?? 0;
+    return {
+      name: tool.name,
+      isError: tool.isError,
+      exitCode: tool.exitCode,
+      excerpt: redacted.slice(0, limit),
+      truncated: tool.resultTruncated === true || tool.resultText.length > limit || redacted.length > limit,
+    };
+  });
+  const input: ClassifierInput = {
+    protocolVersion: 2,
+    decisionKind: "continuation",
+    requestId: options.requestId,
+    originalPromptExcerpt: redactClassifierText(options.originalPrompt).slice(0, options.maxInputChars),
+    ...(options.currentObjective ? { currentObjective: redactClassifierText(options.currentObjective).slice(0, 1_000) } : {}),
+    ...(options.currentPhase ? { currentPhase: redactClassifierText(options.currentPhase).slice(0, 500) } : {}),
+    ...(options.recentAssistantText ? { recentAssistantText: redactClassifierText(options.recentAssistantText).slice(0, 2_000) } : {}),
+    toolCalls: options.tools.map((tool) => ({
+      name: tool.name,
+      inputSummary: summarizeToolInput(tool.input),
+      paths: [...tool.paths],
+    })),
+    toolResults,
+    progress: { ...options.progress },
+    deterministicReasonCodes: [...options.deterministicReasonCodes],
+  };
+  return enforceSerializedInputLimit(input, options.maxInputChars);
+}
+
+/** Build the compact initial classification record without raw history or auth data. */
 export function buildClassifierInput(options: {
   requestId: string;
   prompt: string;
@@ -1065,18 +1211,23 @@ export function buildClassifierInput(options: {
   maxInputChars: number;
 }): ClassifierInput {
   const { capsule } = options;
-  return {
-    protocolVersion: 1,
+  return enforceSerializedInputLimit({
+    protocolVersion: 2,
+    decisionKind: "initial",
     requestId: options.requestId,
-    promptExcerpt: options.prompt.slice(0, options.maxInputChars),
-    cwd: capsule.cwd,
-    imageMetadata: (options.imageMetadata ?? []).map((image) => ({ mimeType: image.mimeType })),
-    explicitPaths: [...capsule.allowedWrite, ...capsule.allowedRead],
-    explicitSteps: [...capsule.steps],
-    expectedArtifacts: capsule.expectedArtifacts.map((a) => a.path ?? a.condition),
-    verification: capsule.verification.map((v) => v.command ?? v.postcondition ?? ""),
+    originalPromptExcerpt: redactClassifierText(options.prompt).slice(0, options.maxInputChars),
+    currentObjective: capsule.objective,
+    currentPhase: capsule.steps[0],
+    toolCalls: [],
+    toolResults: [],
+    progress: {
+      continuationIndex: 0,
+      noProgressCount: 0,
+      verificationSucceeded: false,
+      expectedArtifactsPresent: null,
+    },
     deterministicReasonCodes: [...options.admission.reasonCodes],
-  };
+  }, options.maxInputChars);
 }
 
 /**
@@ -1103,8 +1254,8 @@ export function parseClassifierResponse(text: string): ClassifierParse {
   if (keys.length !== expectedKeys.length || [...expectedKeys].sort().some((k, i) => keys[i] !== k)) {
     return { ok: false, code: "unexpected_fields" };
   }
-  if (record.protocolVersion !== 1) return { ok: false, code: "protocol_mismatch" };
-  if (record.route !== "weak" && record.route !== "strong") {
+  if (record.protocolVersion !== 2) return { ok: false, code: "protocol_mismatch" };
+  if (record.route !== "weak" && record.route !== "user") {
     return { ok: false, code: "invalid_route" };
   }
   const confidence = record.confidence;
@@ -1123,7 +1274,7 @@ export function parseClassifierResponse(text: string): ClassifierParse {
   return {
     ok: true,
     classification: {
-      protocolVersion: 1,
+      protocolVersion: 2,
       route: record.route,
       confidence,
       riskFlags: record.riskFlags as string[],
@@ -1133,7 +1284,7 @@ export function parseClassifierResponse(text: string): ClassifierParse {
 }
 
 export interface RouteDecision {
-  route: "weak" | "strong" | "reject";
+  route: "weak" | "user" | "reject";
   reasonCodes: string[];
 }
 
@@ -1146,21 +1297,21 @@ export function combineRouteDecision(
   if (admission.verdict === "reject") {
     return { route: "reject", reasonCodes: [...admission.reasonCodes] };
   }
-  if (admission.verdict === "strong") {
-    return { route: "strong", reasonCodes: [...admission.reasonCodes] };
+  if (admission.verdict === "user") {
+    return { route: "user", reasonCodes: [...admission.reasonCodes] };
   }
   if (!classification || classification.status === "failed") {
-    return { route: "strong", reasonCodes: ["classifier_failure"] };
+    return { route: "user", reasonCodes: ["classifier_failure"] };
   }
   const result = classification.classification;
   if (result.route !== "weak") {
-    return { route: "strong", reasonCodes: ["classifier_strong"] };
+    return { route: "user", reasonCodes: ["classifier_user"] };
   }
   if (result.confidence < threshold) {
-    return { route: "strong", reasonCodes: ["classifier_low_confidence"] };
+    return { route: "user", reasonCodes: ["classifier_low_confidence"] };
   }
   if (result.riskFlags.length > 0) {
-    return { route: "strong", reasonCodes: ["classifier_risk_flags"] };
+    return { route: "user", reasonCodes: ["classifier_risk_flags"] };
   }
   return { route: "weak", reasonCodes: ["eligible_and_classifier_weak"] };
 }
@@ -2096,6 +2247,7 @@ export function evaluateToolBatch(input: BatchEvaluationInput): BatchEvaluation 
     if (item.isVerification && (item.isError || nonzero)) signals.add("verification_failed");
     else if (item.isError) signals.add("tool_error");
     if (!item.isVerification && nonzero) signals.add("nonzero_exit");
+    if (SENSITIVE_PATTERN.test(JSON.stringify(item.input))) signals.add("sensitive_operation");
     if (capsule) {
       const scope = observeScope(item.toolName, item.input, capsule);
       if (scope.status === "out_of_scope") signals.add("scope_drift");
@@ -2115,6 +2267,7 @@ export function evaluateToolBatch(input: BatchEvaluationInput): BatchEvaluation 
   const progress = detectProgress(input, newFingerprints);
   if (progress) {
     state.noProgressCount = 0;
+    state.operationCounts.clear();
   } else {
     state.noProgressCount += 1;
     if (state.noProgressCount >= limits.maxNoProgressTurns) signals.add("no_progress_limit");
@@ -2152,9 +2305,12 @@ export interface AuditRecordInput {
   admission: { verdict: AdmissionVerdict; reasonCodes: string[] };
   classification:
     | { status: "ok"; route: string; confidence: number; riskFlags: string[]; reasonCode: string; latencyMs: number | null;
-        classifierModel?: string; attemptCount?: number; failureCodes?: string[] }
-    | { status: "failed"; code: string; classifierModel?: string; attemptCount?: number; failureCodes?: string[] }
+        classifierModel?: string; attemptCount?: number; failureCodes?: string[]; inputChars?: number;
+        resultExcerptChars?: number; excerptsTruncated?: boolean }
+    | { status: "failed"; code: string; classifierModel?: string; attemptCount?: number; failureCodes?: string[];
+        inputChars?: number; resultExcerptChars?: number; excerptsTruncated?: boolean }
     | { status: "skipped" };
+  route: RouteDecision["route"];
   targetModel: string | null;
   actualModel: string | null;
   reasonCodes: string[];
@@ -2170,7 +2326,7 @@ export interface AuditRecordInput {
 export function formatAuditRecord(input: AuditRecordInput): Record<string, unknown> {
   const trim = (value: string): string => value.slice(0, input.maxReasonChars);
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     timestamp: input.timestamp,
     mode: input.mode,
     sessionId: input.sessionId,
@@ -2182,6 +2338,10 @@ export function formatAuditRecord(input: AuditRecordInput): Record<string, unkno
       reasonCodes: input.admission.reasonCodes.map(trim),
     },
     classification: input.classification,
+    route: input.route,
+    classifierInputChars: input.classification.status === "skipped" ? 0 : input.classification.inputChars ?? 0,
+    resultExcerptChars: input.classification.status === "skipped" ? 0 : input.classification.resultExcerptChars ?? 0,
+    excerptsTruncated: input.classification.status === "skipped" ? false : input.classification.excerptsTruncated ?? false,
     targetModel: input.targetModel,
     actualModel: input.actualModel,
     reasonCodes: input.reasonCodes.map(trim),
@@ -2223,10 +2383,14 @@ interface ToolObservation {
   isError: boolean;
   exitCode: number | null;
   bytes: number;
+  resultExcerpt: string;
+  resultTruncated: boolean;
 }
 
 interface RequestState {
   requestId: string;
+  originalPrompt: string;
+  requestUserModel?: RuntimeModel;
   turnIndex: number;
   routeState: RouteState;
   admission: { verdict: AdmissionVerdict; reasonCodes: string[] };
@@ -2421,24 +2585,18 @@ export function createModelRouterExtension(dependencies: RouterDependencies = {}
       }
     }
 
-    async function classifyEligible(
-      admission: Admission,
-      prompt: string,
-      images: Array<{ mimeType: string }> | undefined,
-      requestId: string,
+    async function classifyInput(
+      input: ClassifierInput,
       ctx: ExtensionContext,
     ): Promise<Classification> {
       const config = state.config as ResolvedRouterConfig;
-      if (!admission.capsule || !config.models) return { status: "failed", code: "classifier_unavailable" };
-      const input = buildClassifierInput({
-        requestId,
-        prompt,
-        capsule: admission.capsule,
-        admission,
-        imageMetadata: (images ?? []).map((image) => ({ mimeType: image.mimeType })),
-        maxInputChars: config.classification.maxInputChars,
-      });
+      if (!config.models) return { status: "failed", code: "classifier_unavailable" };
       const startedAt = now().getTime();
+      const inputMetadata = {
+        inputChars: JSON.stringify(input).length,
+        resultExcerptChars: input.toolResults.reduce((sum, result) => sum + result.excerpt.length, 0),
+        excerptsTruncated: input.toolResults.some((result) => result.truncated),
+      };
       const deadline = startedAt + config.classification.totalTimeoutMs;
       const failureCodes: string[] = [];
       let attemptCount = 0;
@@ -2460,17 +2618,36 @@ export function createModelRouterExtension(dependencies: RouterDependencies = {}
           ctx,
         );
         if (result.kind === "abort") {
-          return { status: "failed", code: "user_aborted", classifierModel: modelKey(selected) ?? undefined, attemptCount, failureCodes };
+          return { status: "failed", code: "user_aborted", classifierModel: modelKey(selected) ?? undefined, attemptCount, failureCodes, ...inputMetadata };
         }
         if (result.kind === "ok") {
           return { status: "ok", classification: result.classification, latencyMs: now().getTime() - startedAt,
-            classifierModel: modelKey(selected) ?? undefined, attemptCount, failureCodes };
+            classifierModel: modelKey(selected) ?? undefined, attemptCount, failureCodes, ...inputMetadata };
         }
         health.markFailure("classifier", selected, result.reason);
         failureCodes.push(result.code);
       }
       return { status: "failed", code: deadline <= now().getTime() ? "classifier_budget_exhausted" : "classifier_unavailable",
-        classifierModel: modelKey(selected) ?? undefined, attemptCount, failureCodes };
+        classifierModel: modelKey(selected) ?? undefined, attemptCount, failureCodes, ...inputMetadata };
+    }
+
+    async function classifyEligible(
+      admission: Admission,
+      prompt: string,
+      images: Array<{ mimeType: string }> | undefined,
+      requestId: string,
+      ctx: ExtensionContext,
+    ): Promise<Classification> {
+      const config = state.config as ResolvedRouterConfig;
+      if (!admission.capsule) return { status: "failed", code: "classifier_unavailable" };
+      return classifyInput(buildClassifierInput({
+        requestId,
+        prompt,
+        capsule: admission.capsule,
+        admission,
+        imageMetadata: (images ?? []).map((image) => ({ mimeType: image.mimeType })),
+        maxInputChars: config.classification.maxInputChars,
+      }), ctx);
     }
 
     function auditClassification(classification: Classification | undefined): AuditRecordInput["classification"] {
@@ -2479,6 +2656,9 @@ export function createModelRouterExtension(dependencies: RouterDependencies = {}
         ...(classification.classifierModel ? { classifierModel: classification.classifierModel } : {}),
         ...(classification.attemptCount === undefined ? {} : { attemptCount: classification.attemptCount }),
         ...(classification.failureCodes ? { failureCodes: classification.failureCodes } : {}),
+        ...(classification.inputChars === undefined ? {} : { inputChars: classification.inputChars }),
+        ...(classification.resultExcerptChars === undefined ? {} : { resultExcerptChars: classification.resultExcerptChars }),
+        ...(classification.excerptsTruncated === undefined ? {} : { excerptsTruncated: classification.excerptsTruncated }),
       };
       if (classification.status === "failed") {
         return { status: "failed", code: classification.code, ...metadata };
@@ -2602,6 +2782,8 @@ export function createModelRouterExtension(dependencies: RouterDependencies = {}
       );
       state.request = {
         requestId,
+        originalPrompt: event.prompt,
+        requestUserModel: ctx.model,
         turnIndex: 0,
         routeState: "undecided",
         admission: { verdict: admission.verdict, reasonCodes: admission.reasonCodes },
@@ -2670,6 +2852,7 @@ export function createModelRouterExtension(dependencies: RouterDependencies = {}
         decisionKind: "initial",
         admission: state.request.admission,
         classification: state.request.classification,
+        route: state.request.decision.route,
         targetModel: modelKey(state.request.targetModel),
         actualModel: modelKey(actualModelOf(ctx)),
         reasonCodes: state.request.decision.reasonCodes,
@@ -2696,6 +2879,8 @@ export function createModelRouterExtension(dependencies: RouterDependencies = {}
         isError: false,
         exitCode: null,
         bytes: 0,
+        resultExcerpt: "",
+        resultTruncated: false,
       };
       request.observations.set(event.toolCallId, observation);
     }
@@ -2712,7 +2897,12 @@ export function createModelRouterExtension(dependencies: RouterDependencies = {}
       if (!observation) return;
       observation.isError = event.isError;
       observation.exitCode = extractExitCode(event.content, event.details);
-      observation.bytes = event.content.reduce((sum, block) => sum + (block.text?.length ?? 0), 0);
+      const resultText = event.content.map((block) => block.text ?? "").join("\n");
+      observation.bytes = resultText.length;
+      const redacted = redactClassifierText(resultText);
+      observation.resultExcerpt = redacted.slice(0, MAX_TOOL_RESULT_EXCERPT_CHARS);
+      observation.resultTruncated = resultText.length > MAX_TOOL_RESULT_EXCERPT_CHARS ||
+        redacted.length > MAX_TOOL_RESULT_EXCERPT_CHARS;
       if (observation.isVerification && !observation.isError &&
         (observation.exitCode === null || observation.exitCode === 0)) {
         request.verificationSucceeded = true;
@@ -2758,6 +2948,7 @@ export function createModelRouterExtension(dependencies: RouterDependencies = {}
           decisionKind: "completion",
           admission: request.admission,
           classification: request.classification,
+          route: request.decision.route,
           targetModel: modelKey(request.targetModel),
           actualModel: modelKey(actual),
           reasonCodes: request.decision.reasonCodes,
@@ -2772,42 +2963,122 @@ export function createModelRouterExtension(dependencies: RouterDependencies = {}
       }
 
       request.turnIndex = event.turnIndex;
-      const shouldEvaluate = request.decision.route === "weak" &&
-        (state.runtimeMode === "shadow" || request.routeState === "weak-lease");
-      if (shouldEvaluate) {
-        const evalState = {
-          operationCounts: request.operationCounts,
-          progressMemo: request.progressMemo,
-          noProgressCount: request.noProgressCount,
-          weakContinuationCount: request.weakContinuationCount,
-        };
-        const evaluation = evaluateToolBatch({
-          batch: batch.map((observation) => ({
-            toolName: observation.toolName,
-            input: observation.input,
-            fingerprint: observation.fingerprint,
-            isError: observation.isError,
-            exitCode: observation.exitCode,
-            isVerification: observation.isVerification,
-          })),
-          capsule: request.capsule,
-          limits: state.config.limits,
-          state: evalState,
-          target: state.runtimeMode === "active" ? request.targetModel : null,
-          actual: state.runtimeMode === "active" ? actual : null,
-          fsExists: (path) => fs.exists(path),
-        });
-        request.noProgressCount = evalState.noProgressCount;
-        request.weakContinuationCount = evalState.weakContinuationCount;
-        for (const signal of evaluation.signals) request.signals.add(signal);
-        if (state.runtimeMode === "active" && evaluation.signals.length > 0) {
-          await releaseWeakLease();
-        }
-      }
+      const evalState = {
+        operationCounts: request.operationCounts,
+        progressMemo: request.progressMemo,
+        noProgressCount: request.noProgressCount,
+        weakContinuationCount: request.weakContinuationCount,
+      };
+      const evaluation = evaluateToolBatch({
+        batch: batch.map((observation) => ({
+          toolName: observation.toolName,
+          input: observation.input,
+          fingerprint: observation.fingerprint,
+          isError: observation.isError,
+          exitCode: observation.exitCode,
+          isVerification: observation.isVerification,
+        })),
+        capsule: request.capsule,
+        limits: state.config.limits,
+        state: evalState,
+        target: state.runtimeMode === "active" && request.routeState === "weak-lease" ? request.targetModel : null,
+        actual: state.runtimeMode === "active" && request.routeState === "weak-lease" ? actual : null,
+        fsExists: (path) => fs.exists(path),
+      });
+      request.noProgressCount = evalState.noProgressCount;
+      request.weakContinuationCount = evalState.weakContinuationCount;
+      for (const signal of evaluation.signals) request.signals.add(signal);
 
       const artifactsPresent = request.capsule
         ? checkExpectedArtifacts(request.capsule, (path) => fs.exists(path)).missing.length === 0
         : false;
+      const weakModel = state.readiness?.selections.weak?.status === "ready"
+        ? state.readiness.selections.weak.model as { contextWindow?: number }
+        : undefined;
+      const usage = message.usage as { input?: number; output?: number } | undefined;
+      const estimatedContext = Math.max(0, usage?.input ?? 0) + Math.max(0, usage?.output ?? 0) + 4_096;
+      if (typeof weakModel?.contextWindow === "number" && estimatedContext > weakModel.contextWindow) {
+        evaluation.signals.push("weak_context_incompatible");
+        request.signals.add("weak_context_incompatible");
+      }
+      const hardUserSignals = [...new Set(evaluation.signals)]
+        .filter((signal) => signal !== "scope_observation_uncertain");
+      let continuationClassification: Classification | undefined;
+      let continuationDecision: RouteDecision;
+      if (hardUserSignals.length > 0) {
+        continuationDecision = { route: "user", reasonCodes: hardUserSignals };
+        if (hardUserSignals.includes("weak_turn_limit")) request.weakContinuationCount = 0;
+      } else {
+        const messageContent = Array.isArray((event.message as { content?: unknown }).content)
+          ? (event.message as { content: Array<{ type?: string; text?: string }> }).content
+              .filter((block) => block.type === "text" && typeof block.text === "string")
+              .map((block) => block.text as string)
+              .join("\n")
+          : "";
+        const continuationInput = buildContinuationClassifierInput({
+          requestId: request.requestId,
+          originalPrompt: request.originalPrompt,
+          currentObjective: request.capsule?.objective,
+          currentPhase: request.capsule?.steps[Math.min(event.turnIndex, (request.capsule?.steps.length ?? 1) - 1)],
+          recentAssistantText: messageContent,
+          tools: batch.map((observation) => ({
+            name: observation.toolName,
+            input: observation.input,
+            paths: observation.paths,
+            isError: observation.isError,
+            exitCode: observation.exitCode,
+            resultText: observation.resultExcerpt,
+            resultTruncated: observation.resultTruncated,
+          })),
+          progress: {
+            continuationIndex: request.weakContinuationCount,
+            noProgressCount: request.noProgressCount,
+            verificationSucceeded: request.verificationSucceeded,
+            expectedArtifactsPresent: request.capsule ? artifactsPresent : null,
+          },
+          deterministicReasonCodes: evaluation.signals,
+          maxContinuationResultChars: state.config.classification.maxContinuationResultChars,
+          maxInputChars: state.config.classification.maxInputChars,
+        });
+        continuationClassification = await classifyInput(continuationInput, ctx);
+        continuationDecision = combineRouteDecision(
+          { verdict: "eligible", reasonCodes: ["continuation_boundary"] },
+          continuationClassification,
+          state.config.classification.minWeakConfidence,
+        );
+      }
+
+      request.classification = auditClassification(continuationClassification);
+      request.decision = continuationDecision;
+      const weakSelection = state.readiness?.selections.weak;
+      request.targetModel = targetIdentity(continuationDecision.route, weakSelection);
+      if (state.runtimeMode === "active") {
+        if (continuationDecision.route === "user") {
+          if (request.routeState === "weak-lease") {
+            await releaseWeakLease();
+          } else if (request.requestUserModel && ctx.model !== request.requestUserModel) {
+            await pi.setModel(request.requestUserModel);
+          }
+        } else if (continuationDecision.route === "weak") {
+          const selectedKey = weakSelection?.status === "ready" ? modelKey(weakSelection.identity) : null;
+          if (modelKey(actualModelOf(ctx)) !== selectedKey) {
+            const switched = await switchWeakModel(ctx, false);
+            request.weakFailureCodes = [...switched.failureCodes];
+            request.weakFallbackCount = switched.failureCodes.length;
+            if (switched.status === "ready") {
+              request.targetModel = { provider: switched.identity.provider, id: switched.identity.id };
+              request.routeState = "weak-lease";
+              request.leaseReturnModel = request.requestUserModel;
+            } else if (request.requestUserModel && ctx.model !== request.requestUserModel) {
+              await pi.setModel(request.requestUserModel);
+            }
+          } else {
+            request.routeState = "weak-lease";
+            request.leaseReturnModel = request.requestUserModel;
+          }
+        }
+      }
+
       appendAudit(formatAuditRecord({
         timestamp: now().toISOString(),
         mode: state.runtimeMode,
@@ -2817,6 +3088,7 @@ export function createModelRouterExtension(dependencies: RouterDependencies = {}
         decisionKind: "continuation",
         admission: request.admission,
         classification: request.classification,
+        route: request.decision.route,
         targetModel: modelKey(request.targetModel),
         actualModel: modelKey(actual),
         reasonCodes: request.decision.reasonCodes,
@@ -2850,6 +3122,7 @@ export function createModelRouterExtension(dependencies: RouterDependencies = {}
           decisionKind: "continuation",
           admission: request.admission,
           classification: request.classification,
+          route: request.decision.route,
           targetModel: modelKey(request.targetModel),
           actualModel: modelKey(actualModelOf(ctx)),
           reasonCodes: request.decision.reasonCodes,
@@ -3093,17 +3366,18 @@ export function createModelRouterExtension(dependencies: RouterDependencies = {}
         ? entries.filter((e) => String(e.sessionId ?? "") === currentSession)
         : entries;
       const selected = sessionEntries.length > 0 ? sessionEntries : entries;
-      let strong = 0, eligible = 0, reject = 0;
+      let user = 0, eligible = 0, reject = 0;
       let clsSkipped = 0, clsOk = 0, clsFailed = 0;
       let weakTarget = 0;
-      const strongReasons = new Map<string, number>();
+      const userReasons = new Map<string, number>();
       const weakTargets: { reqId: string; turn: number; conf: number; risk: string[]; weak: string }[] = [];
       for (const entry of selected) {
         const admission = entry.admission as Record<string, unknown> | undefined;
         const verdict = String(admission?.verdict ?? "");
-        if (verdict === "strong") {
-          strong++;
-          for (const r of (admission?.reasonCodes as string[]) ?? []) strongReasons.set(r, (strongReasons.get(r) ?? 0) + 1);
+        const schemaVersion = Number(entry.schemaVersion ?? 1);
+        if (verdict === "user" || (schemaVersion === 1 && verdict === "strong")) {
+          user++;
+          for (const r of (admission?.reasonCodes as string[]) ?? []) userReasons.set(r, (userReasons.get(r) ?? 0) + 1);
         } else if (verdict === "eligible") eligible++;
         else if (verdict === "reject") reject++;
         const cls = entry.classification as Record<string, unknown> | undefined;
@@ -3124,14 +3398,14 @@ export function createModelRouterExtension(dependencies: RouterDependencies = {}
       }
       const total = selected.length;
       const pct = (n: number) => total > 0 ? ` (${(n / total * 100).toFixed(1)}%)` : "";
-      const reasonsList = [...strongReasons.entries()].map(([k, v]) => `${k}(${v})`).join(", ");
+      const reasonsList = [...userReasons.entries()].map(([k, v]) => `${k}(${v})`).join(", ");
       const lines: string[] = [
         `Shadow Review \u2014 Session: ${state.sessionId ?? "(unknown)"}`,
         `Time range: ${String(selected[0]?.timestamp ?? "").slice(0, 19)} \u2192 ${String(selected[selected.length - 1]?.timestamp ?? "").slice(0, 19)}`,
         `Total records: ${total}`,
         "",
         "Route decision by admission:",
-        `  strong  ${String(strong).padStart(4)}${pct(strong)}     ${reasonsList}`,
+        `  user    ${String(user).padStart(4)}${pct(user)}     ${reasonsList}`,
         `  reject  ${String(reject).padStart(4)}${pct(reject)}`,
         `  eligible ${String(eligible).padStart(3)}${pct(eligible)}`,
         "",
@@ -3153,7 +3427,7 @@ export function createModelRouterExtension(dependencies: RouterDependencies = {}
       }
       lines.push("");
       if (weakTarget === 0 && clsFailed === 0) {
-        if (strong === total) {
+        if (user === total) {
           lines.push("Assessment: All requests were handled by the user model. The deterministic");
           lines.push("admission rules caught everything before classification ran. Enabling active");
           lines.push("mode would have had no effect on this session.");
@@ -3301,7 +3575,7 @@ function statusBarText(state: RuntimeState): string | undefined {
     const cap = state.config?.limits.maxWeakContinuationTurns ?? 0;
     return `routing:active · weak=${modelKey(request.targetModel) ?? "-"} · turn=${request.weakContinuationCount}/${cap}`;
   }
-  return `routing:active · strong`;
+  return `routing:active · user`;
 }
 
 function notify(ctx: ExtensionContext, message: string, type: "info" | "warning" | "error"): void {

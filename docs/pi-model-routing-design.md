@@ -1,5 +1,10 @@
 # Pi 多模型自动分流设计
 
+> **状态：已放弃（2026-07-12）**
+> 此方案的核心机制——在 `turn_end` 预测下一轮 LLM 请求的复杂度——被评估为不可靠的预测问题，不符合原始需求。详见 [`model-router/README.md`](../model-router/README.md)。
+> 所有相关代码、配置、测试和数据分析已归档至 [`model-router/`](../model-router/) 目录。
+> 以下文档保留为历史记录，不反映当前推荐做法。
+
 ## 1. 摘要
 
 Model Router 是一个 downgrade-only Pi Extension。它在每个 provider request 边界独立决定使用：
